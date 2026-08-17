@@ -11,10 +11,7 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_REPO = process.env.GITHUB_REPO;
 const GITHUB_LOG_PATH = process.env.GITHUB_LOG_PATH || 'data/pdf-dashboard.md';
 
-if (!BOT_TOKEN) throw new Error('TELEGRAM_BOT_TOKEN is required');
-if (!CHANNEL_ID) throw new Error('TELEGRAM_CHANNEL_ID is required');
-
-const telegramBase = `${TELEGRAM_API_BASE}${BOT_TOKEN}`;
+const telegramBase = `${TELEGRAM_API_BASE}${BOT_TOKEN || ''}`;
 
 type TelegramUser = { id: number; first_name?: string; last_name?: string; username?: string };
 type TelegramDocument = { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
@@ -169,6 +166,7 @@ async function processDocument(message: TelegramMessage): Promise<void> {
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === 'GET') return res.status(200).json({ ok: true, service: 'telegram-pdf-classifier' });
   if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'Method not allowed' });
+  if (!BOT_TOKEN || !CHANNEL_ID) return res.status(503).json({ ok: false, error: 'Telegram credentials are not configured yet.' });
   if (WEBHOOK_SECRET && req.headers['x-telegram-bot-api-secret-token'] !== WEBHOOK_SECRET) return res.status(401).json({ ok: false, error: 'Unauthorized' });
 
   try {
