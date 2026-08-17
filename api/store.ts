@@ -36,6 +36,11 @@ async function openDb(): Promise<ParadConnection> {
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`);
+  db.execute(`CREATE TABLE IF NOT EXISTS chat_category_context (
+    chat_id INTEGER PRIMARY KEY,
+    category_id TEXT,
+    updated_at TEXT NOT NULL
+  )`);
   return db;
 }
 
@@ -149,6 +154,7 @@ export async function deleteCategory(id: string): Promise<void> {
   const category = db.execute('SELECT parent_id FROM categories WHERE id = ?', [id]).rows[0] as { parent_id?: string | null } | undefined;
   if (!category) throw new Error('Category not found');
   db.execute('UPDATE pdf_records SET category_id = NULL WHERE category_id = ?', [id]);
+  db.execute('UPDATE chat_category_context SET category_id = NULL, updated_at = ? WHERE category_id = ?', [new Date().toISOString(), id]);
   db.execute('UPDATE categories SET parent_id = ?, updated_at = ? WHERE parent_id = ?', [category.parent_id || null, new Date().toISOString(), id]);
   db.execute('DELETE FROM categories WHERE id = ?', [id]);
 }
@@ -157,6 +163,18 @@ export async function assignRecordCategory(recordId: string, categoryId: string 
   const db = await getDb();
   if (categoryId && !db.execute('SELECT id FROM categories WHERE id = ?', [categoryId]).rows.length) throw new Error('Category not found');
   db.execute('UPDATE pdf_records SET category_id = ? WHERE id = ?', [categoryId, recordId]);
+}
+
+export async function setChatActiveCategory(chatId: number, categoryId: string | null): Promise<void> {
+  const db = await getDb();
+  db.execute(`INSERT INTO chat_category_context (chat_id, category_id, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(chat_id) DO UPDATE SET category_id = excluded.category_id, updated_at = excluded.updated_at`, [chatId, categoryId, new Date().toISOString()]);
+}
+
+export async function getChatActiveCategory(chatId: number): Promise<string | null> {
+  const db = await getDb();
+  const row = db.execute('SELECT category_id FROM chat_category_context WHERE chat_id = ?', [chatId]).rows[0] as { category_id?: string | null } | undefined;
+  return row?.category_id || null;
 }
 
 function cell(value: unknown): string {
