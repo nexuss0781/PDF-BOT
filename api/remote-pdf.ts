@@ -2,7 +2,7 @@ import type { TelegramDocument } from './types.js';
 
 export type RemoteClassification = {
   type: 'Selectable' | 'Scanned' | 'Needs inspection';
-  strategy: 'remote-full-under-30mb' | 'remote-range-sampled' | 'remote-bounded-full' | 'failed';
+  strategy: 'remote-full-under-30mb' | 'remote-range-sampled' | 'remote-bounded-full' | 'remote-ocr-aware' | 'remote-text-layer' | 'failed';
   bytesRead: number;
   pagesSampled: number;
   reason: string;
@@ -47,22 +47,33 @@ async function discoverSize(url: string, document: TelegramDocument): Promise<nu
 
 async function pdfjs() { return await import('pdfjs-dist/legacy/build/pdf.mjs') as any; }
 
-async function classifyPdf(pdf: any, strategy: RemoteClassification['strategy'], bytesRead: number, reason: string): Promise<RemoteClassification> {
+async function classifyPdf(pdf: any, pdfjsModule: any, strategy: RemoteClassification['strategy'], bytesRead: number, reason: string): Promise<RemoteClassification> {
   let text = '';
+  let pagesWithImages = 0;
   const pages = Math.min(SAMPLE_PAGES, pdf.numPages);
+  const imageOps = new Set([
+    pdfjsModule.OPS?.paintImageXObject,
+    pdfjsModule.OPS?.paintInlineImageXObject,
+    pdfjsModule.OPS?.paintImageMaskXObject,
+  ].filter((value: any) => typeof value === 'number'));
   for (let pageNo = 1; pageNo <= pages; pageNo += 1) {
     const page = await pdf.getPage(pageNo);
     const content = await page.getTextContent({ disableCombineTextItems: false });
     text += content.items.map((item: any) => item.str || '').join(' ');
-    if (text.replace(/\s+/g, ' ').trim().length >= TEXT_THRESHOLD) break;
+    const operatorList = await page.getOperatorList();
+    if (operatorList.fnArray.some((fn: number) => imageOps.has(fn))) pagesWithImages += 1;
   }
   await pdf.destroy();
+  const normalizedTextLength = text.replace(/\s+/g, ' ').trim().length;
+  const textFound = normalizedTextLength >= TEXT_THRESHOLD;
+  const majorityImagePages = pagesWithImages >= Math.max(1, Math.ceil(pages / 2));
+  const scanned = !textFound || majorityImagePages;
   return {
-    type: text.replace(/\s+/g, ' ').trim().length >= TEXT_THRESHOLD ? 'Selectable' : 'Scanned',
-    strategy,
+    type: scanned ? 'Scanned' : 'Selectable',
+    strategy: scanned && textFound ? 'remote-ocr-aware' : (scanned ? strategy : 'remote-text-layer'),
     bytesRead,
     pagesSampled: pages,
-    reason,
+    reason: scanned && textFound ? `${reason} Image-backed pages indicate an OCR layer over scans.` : reason,
   };
 }
 
@@ -93,14 +104,15 @@ export async function classifyRemotePdf(document: TelegramDocument, filePath: st
   const url = fileUrl(filePath);
   const size = await discoverSize(url, document);
   try {
-    const { getDocument, PDFDataRangeTransport } = await pdfjs();
+    const pdfjsModule = await pdfjs();
+    const { getDocument, PDFDataRangeTransport } = pdfjsModule;
 
     if (size <= SMALL_LIMIT) {
       const response = await fetch(url);
       if (!response.ok) throw new Error(`Remote PDF download failed: HTTP ${response.status}`);
       const data = new Uint8Array(await response.arrayBuffer());
       const pdf = await getDocument({ data, stopAtErrors: false }).promise;
-      return await classifyPdf(pdf, 'remote-full-under-30mb', data.byteLength, 'Fetched the complete PDF because it is under the 30 MB inspection threshold.');
+      return await classifyPdf(pdf, pdfjsModule, 'remote-full-under-30mb', data.byteLength, 'Fetched the complete PDF because it is under the 30 MB inspection threshold.');
     }
 
     const source = new RemoteRangeTransport(url, size);
@@ -108,7 +120,7 @@ export async function classifyRemotePdf(document: TelegramDocument, filePath: st
     (transport as any).requestDataRange = (begin: number, end: number) => source.requestDataRange(begin, end);
     (transport as any).addRangeListener = (begin: number, listener: (chunk: Uint8Array) => void) => source.addRangeListener(begin, listener);
     const pdf = await getDocument({ range: transport, length: size, disableAutoFetch: true, disableStream: true, stopAtErrors: false }).promise;
-    return await classifyPdf(pdf, 'remote-range-sampled', source.bytesRead, 'Used PDF.js byte-range inspection without downloading the full PDF.');
+    return await classifyPdf(pdf, pdfjsModule, 'remote-range-sampled', source.bytesRead, 'Used PDF.js byte-range inspection without downloading the full PDF.');
   } catch (error) {
     console.error('Remote PDF classification error:', error);
     return { type: 'Needs inspection', strategy: 'failed', bytesRead: 0, pagesSampled: 0, reason: String(error).slice(0, 240) };
