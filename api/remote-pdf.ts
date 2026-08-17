@@ -2,7 +2,7 @@ import type { TelegramDocument } from './types.js';
 
 export type RemoteClassification = {
   type: 'Selectable' | 'Scanned' | 'Needs inspection';
-  strategy: 'remote-range-sampled' | 'remote-bounded-full' | 'failed';
+  strategy: 'remote-full-under-30mb' | 'remote-range-sampled' | 'remote-bounded-full' | 'failed';
   bytesRead: number;
   pagesSampled: number;
   reason: string;
@@ -45,6 +45,27 @@ async function discoverSize(url: string, document: TelegramDocument): Promise<nu
   throw new Error('Remote file size is unavailable');
 }
 
+async function pdfjs() { return await import('pdfjs-dist/legacy/build/pdf.mjs') as any; }
+
+async function classifyPdf(pdf: any, strategy: RemoteClassification['strategy'], bytesRead: number, reason: string): Promise<RemoteClassification> {
+  let text = '';
+  const pages = Math.min(SAMPLE_PAGES, pdf.numPages);
+  for (let pageNo = 1; pageNo <= pages; pageNo += 1) {
+    const page = await pdf.getPage(pageNo);
+    const content = await page.getTextContent({ disableCombineTextItems: false });
+    text += content.items.map((item: any) => item.str || '').join(' ');
+    if (text.replace(/\s+/g, ' ').trim().length >= TEXT_THRESHOLD) break;
+  }
+  await pdf.destroy();
+  return {
+    type: text.replace(/\s+/g, ' ').trim().length >= TEXT_THRESHOLD ? 'Selectable' : 'Scanned',
+    strategy,
+    bytesRead,
+    pagesSampled: pages,
+    reason,
+  };
+}
+
 class RemoteRangeTransport {
   readonly length: number;
   bytesRead = 0;
@@ -68,29 +89,28 @@ class RemoteRangeTransport {
   }
 }
 
-async function pdfjs() { return await import('pdfjs-dist/legacy/build/pdf.mjs') as any; }
-
 export async function classifyRemotePdf(document: TelegramDocument, filePath: string): Promise<RemoteClassification> {
   const url = fileUrl(filePath);
   const size = await discoverSize(url, document);
   try {
     const { getDocument, PDFDataRangeTransport } = await pdfjs();
+
+    if (size <= SMALL_LIMIT) {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`Remote PDF download failed: HTTP ${response.status}`);
+      const data = new Uint8Array(await response.arrayBuffer());
+      const pdf = await getDocument({ data, stopAtErrors: false }).promise;
+      return await classifyPdf(pdf, 'remote-full-under-30mb', data.byteLength, 'Fetched the complete PDF because it is under the 30 MB inspection threshold.');
+    }
+
     const source = new RemoteRangeTransport(url, size);
     const transport = new PDFDataRangeTransport(size, null, false);
     (transport as any).requestDataRange = (begin: number, end: number) => source.requestDataRange(begin, end);
     (transport as any).addRangeListener = (begin: number, listener: (chunk: Uint8Array) => void) => source.addRangeListener(begin, listener);
     const pdf = await getDocument({ range: transport, length: size, disableAutoFetch: true, disableStream: true, stopAtErrors: false }).promise;
-    let text = '';
-    const pages = Math.min(SAMPLE_PAGES, pdf.numPages);
-    for (let pageNo = 1; pageNo <= pages; pageNo += 1) {
-      const page = await pdf.getPage(pageNo);
-      const content = await page.getTextContent({ disableCombineTextItems: false });
-      text += content.items.map((item: any) => item.str || '').join(' ');
-      if (text.replace(/\s+/g, ' ').trim().length >= TEXT_THRESHOLD) break;
-    }
-    await pdf.destroy();
-    return { type: text.replace(/\s+/g, ' ').trim().length >= TEXT_THRESHOLD ? 'Selectable' : 'Scanned', strategy: 'remote-range-sampled', bytesRead: source.bytesRead, pagesSampled: pages, reason: size <= SMALL_LIMIT ? 'Remote PDF.js inspection for a file under 30 MB.' : 'Remote PDF.js range inspection without full download.' };
+    return await classifyPdf(pdf, 'remote-range-sampled', source.bytesRead, 'Used PDF.js byte-range inspection without downloading the full PDF.');
   } catch (error) {
+    console.error('Remote PDF classification error:', error);
     return { type: 'Needs inspection', strategy: 'failed', bytesRead: 0, pagesSampled: 0, reason: String(error).slice(0, 240) };
   }
 }
