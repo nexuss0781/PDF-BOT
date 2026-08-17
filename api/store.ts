@@ -73,6 +73,14 @@ export type Category = {
   updated_at: string;
 };
 
+export type BackupPackage = {
+  format: 'telegram-pdf-bot-backup';
+  version: 1;
+  exported_at: string;
+  pdf_records: PdfRecord[];
+  categories: Category[];
+};
+
 export async function savePending(record: PdfRecord): Promise<void> {
   const db = await getDb();
   db.execute(`INSERT INTO pdf_records (id, title, sender, sender_id, classification, source_url, received_at, strategy, bytes_read, pages_sampled, metadata_message_id, category_id)
@@ -184,6 +192,61 @@ function cell(value: unknown): string {
 export function recordsToMarkdown(records: PdfRecord[]): string {
   const rows = records.map((record) => `| ${cell(record.title)} | ${cell(record.sender)} | **${cell(record.classification)}** | [Open PDF](${record.source_url}) | ${cell(record.received_at)} | ${cell(record.strategy || '')} |`);
   return ['# PDF Dashboard', '', '| Title | Sender | Type | Telegram source | Received | Strategy |', '|---|---|---|---|---|---|', ...rows, ''].join('\n');
+}
+
+export async function exportBackup(): Promise<BackupPackage> {
+  return {
+    format: 'telegram-pdf-bot-backup',
+    version: 1,
+    exported_at: new Date().toISOString(),
+    pdf_records: await listRecords(),
+    categories: await listCategories(),
+  };
+}
+
+function validateBackup(value: unknown): BackupPackage {
+  if (!value || typeof value !== 'object') throw new Error('Backup must be a JSON object');
+  const candidate = value as Partial<BackupPackage>;
+  if (candidate.format !== 'telegram-pdf-bot-backup' || candidate.version !== 1) throw new Error('Unsupported backup format or version');
+  if (!Array.isArray(candidate.pdf_records) || !Array.isArray(candidate.categories)) throw new Error('Backup is missing records or categories');
+  const categoryIds = new Set(candidate.categories.map((category) => category.id));
+  for (const category of candidate.categories) {
+    if (!category.id || !category.name) throw new Error('Backup contains an invalid category');
+    if (category.parent_id && !categoryIds.has(category.parent_id)) throw new Error('Backup contains a missing parent category');
+  }
+  for (const record of candidate.pdf_records) {
+    if (!record.id || !record.title || !record.classification) throw new Error('Backup contains an invalid PDF record');
+    if (record.category_id && !categoryIds.has(record.category_id)) throw new Error('Backup contains a record with a missing category');
+  }
+  return candidate as BackupPackage;
+}
+
+export async function clearAllData(): Promise<void> {
+  const db = await getDb();
+  db.execute('DELETE FROM pdf_records');
+  db.execute('DELETE FROM categories');
+  db.execute('DELETE FROM chat_category_context');
+}
+
+export async function restoreBackup(value: unknown): Promise<void> {
+  const backup = validateBackup(value);
+  const db = await getDb();
+  db.execute('BEGIN');
+  try {
+    db.execute('DELETE FROM pdf_records');
+    db.execute('DELETE FROM categories');
+    db.execute('DELETE FROM chat_category_context');
+    for (const category of backup.categories) {
+      db.execute('INSERT INTO categories (id, name, parent_id, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)', [category.id, category.name, category.parent_id || null, category.sort_order || 0, category.created_at, category.updated_at]);
+    }
+    for (const record of backup.pdf_records) {
+      db.execute(`INSERT INTO pdf_records (id, title, sender, sender_id, classification, source_url, received_at, strategy, bytes_read, pages_sampled, metadata_message_id, category_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [record.id, record.title, record.sender, record.sender_id, record.classification, record.source_url, record.received_at, record.strategy || null, record.bytes_read || 0, record.pages_sampled || 0, record.metadata_message_id, record.category_id || null]);
+    }
+    db.execute('COMMIT');
+  } catch (error) {
+    try { db.execute('ROLLBACK'); } catch { /* best effort */ }
+    throw error;
+  }
 }
 
 export async function closeDb(): Promise<void> {
