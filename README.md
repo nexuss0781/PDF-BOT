@@ -62,7 +62,7 @@ The verified Render panel responds to tokenized Bot API requests such as `getMe`
 
 ## Telegram behavior
 
-Users send PDFs to the bot. The bot immediately copies the original file into the destination channel and posts a metadata message with the title, sender, source link, and current classification status. After Vercel finishes the remote range inspection, the metadata message is edited to show the final classification and strategy. The channel document contains inline **Scanned** and **Selectable** buttons. Users can also send `/scanned` or `/selectable` to receive categorized source links.
+Users send PDFs to the bot. The bot acknowledges the upload immediately, performs the PDF.js inspection, edits that reply with the final **Scanned** or **Selectable** classification, and only then copies the original file into the destination channel. The channel copy receives a metadata caption containing the title, sender, source link, inspection strategy, and the same two inline category buttons. Pressing **Selectable PDFs** or **Scanned PDFs** in the bot chat returns every stored PDF in that category as a numbered list of links to the channel. Users can also send `/scanned`, `/selectable`, or `/selective` to open a category directly.
 
 ## Bandwidth and safety controls
 
