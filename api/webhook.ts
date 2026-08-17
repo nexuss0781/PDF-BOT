@@ -123,7 +123,7 @@ async function processDocument(message: TelegramMessage): Promise<void> {
   const document = message.document!;
   const title = document.file_name || 'Untitled PDF';
   const recordId = `${Date.now()}-${message.message_id}`;
-  const keyboard = { inline_keyboard: [[{ text: 'Scanned', callback_data: 'list:Scanned' }, { text: 'Selectable', callback_data: 'list:Selectable' }]] };
+  const botKeyboard = { inline_keyboard: [[{ text: 'Scanned', callback_data: 'list:Scanned' }, { text: 'Selectable', callback_data: 'list:Selectable' }]] };
   // Telegram copies the original document server-side; the Vercel app does not re-upload it.
   let copied: { message_id: number };
   try {
@@ -131,7 +131,6 @@ async function processDocument(message: TelegramMessage): Promise<void> {
       chat_id: CHANNEL_ID,
       from_chat_id: message.chat.id,
       message_id: message.message_id,
-      reply_markup: keyboard,
     });
   } catch (error) {
     console.error('Channel forwarding failed:', error);
@@ -169,7 +168,7 @@ async function processDocument(message: TelegramMessage): Promise<void> {
     const result = await classifyRemotePdf(document, file.file_path);
     if (PARADOX_ENABLED) await updateParadoxRecord(recordId, { classification: result.type, strategy: result.strategy, bytes_read: result.bytesRead, pages_sampled: result.pagesSampled });
     await telegram('editMessageText', { chat_id: CHANNEL_ID, message_id: metadata.message_id, text: `<b>Title:</b> ${escapeHtml(title)}\\n<b>Type:</b> ${escapeHtml(result.type)}\\n<b>Strategy:</b> ${escapeHtml(result.strategy)}\\n<a href="${sourceUrl}">Open PDF</a>`, parse_mode: 'HTML', disable_web_page_preview: true });
-    await telegram('sendMessage', { chat_id: message.chat.id, text: `Received *${escapeMarkdown(title)}*.\\nClassification: *${escapeMarkdown(result.type)}*`, parse_mode: 'MarkdownV2' });
+    await telegram('sendMessage', { chat_id: message.chat.id, text: `Received *${escapeMarkdown(title)}*.\\nClassification: *${escapeMarkdown(result.type)}*\\nChoose a category to list matching PDFs from the channel.`, parse_mode: 'MarkdownV2', reply_markup: botKeyboard });
   } catch (error) {
     if (PARADOX_ENABLED) await updateParadoxRecord(recordId, { classification: 'Needs inspection', strategy: 'failed' });
     await telegram('editMessageText', { chat_id: CHANNEL_ID, message_id: metadata.message_id, text: `<b>Title:</b> ${escapeHtml(title)}\\n<b>Type:</b> Needs inspection\\n<b>Strategy:</b> failed\\n<a href="${sourceUrl}">Open PDF</a>`, parse_mode: 'HTML', disable_web_page_preview: true });
