@@ -120,13 +120,23 @@ async function processDocument(message: TelegramMessage): Promise<void> {
   const title = document.file_name || 'Untitled PDF';
   const recordId = `${Date.now()}-${message.message_id}`;
   const keyboard = { inline_keyboard: [[{ text: 'Scanned', callback_data: 'list:Scanned' }, { text: 'Selectable', callback_data: 'list:Selectable' }]] };
-  // Telegram copies the original document server-side; the Vercel/Render worker does not re-upload it.
-  const copied = await telegram<{ message_id: number }>('copyMessage', {
-    chat_id: CHANNEL_ID,
-    from_chat_id: message.chat.id,
-    message_id: message.message_id,
-    reply_markup: keyboard,
-  });
+  // Telegram copies the original document server-side; the Vercel app does not re-upload it.
+  let copied: { message_id: number };
+  try {
+    copied = await telegram<{ message_id: number }>('copyMessage', {
+      chat_id: CHANNEL_ID,
+      from_chat_id: message.chat.id,
+      message_id: message.message_id,
+      reply_markup: keyboard,
+    });
+  } catch (error) {
+    console.error('Channel forwarding failed:', error);
+    await telegram('sendMessage', {
+      chat_id: message.chat.id,
+      text: 'I received your PDF, but I could not forward it to the configured channel. Please verify TELEGRAM_CHANNEL_ID and make sure this bot is an administrator of that channel with permission to post messages.',
+    });
+    return;
+  }
   const sourceUrl = channelMessageUrl(copied.message_id);
   const metadata = await telegram<{ message_id: number }>('sendMessage', {
     chat_id: CHANNEL_ID,
