@@ -112,7 +112,11 @@ async function sendCategoryList(chatId: number, type: RecordEntry['type']): Prom
 }
 
 function escapeMarkdown(value: string): string {
-  return value.replace(/[\\_*\[\]()~`>#+\-=|{}.!]/g, '\\$&');
+  return value.replace(/[\\_*\[\]()~`>#+\-=|{}.!]/g, '\\$&');
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character] || character));
 }
 
 async function processDocument(message: TelegramMessage): Promise<void> {
@@ -140,8 +144,8 @@ async function processDocument(message: TelegramMessage): Promise<void> {
   const sourceUrl = channelMessageUrl(copied.message_id);
   const metadata = await telegram<{ message_id: number }>('sendMessage', {
     chat_id: CHANNEL_ID,
-    text: `Title: ${title}\\nType: Processing\\nSender: ${senderName(message.from)}\\n[Open PDF](${sourceUrl})`,
-    parse_mode: 'Markdown',
+    text: `<b>Title:</b> ${escapeHtml(title)}\\n<b>Type:</b> Processing\\n<b>Sender:</b> ${escapeHtml(senderName(message.from))}\\n<a href="${sourceUrl}">Open PDF</a>`,
+    parse_mode: 'HTML',
     disable_web_page_preview: true,
   });
   const entry: RecordEntry = {
@@ -164,11 +168,11 @@ async function processDocument(message: TelegramMessage): Promise<void> {
     const file = await telegram<{ file_path: string }>('getFile', { file_id: document.file_id });
     const result = await classifyRemotePdf(document, file.file_path);
     if (PARADOX_ENABLED) await updateParadoxRecord(recordId, { classification: result.type, strategy: result.strategy, bytes_read: result.bytesRead, pages_sampled: result.pagesSampled });
-    await telegram('editMessageText', { chat_id: CHANNEL_ID, message_id: metadata.message_id, text: `Title: ${title}\\nType: ${result.type}\\nStrategy: ${result.strategy}\\n[Open PDF](${sourceUrl})`, parse_mode: 'Markdown', disable_web_page_preview: true });
+    await telegram('editMessageText', { chat_id: CHANNEL_ID, message_id: metadata.message_id, text: `<b>Title:</b> ${escapeHtml(title)}\\n<b>Type:</b> ${escapeHtml(result.type)}\\n<b>Strategy:</b> ${escapeHtml(result.strategy)}\\n<a href="${sourceUrl}">Open PDF</a>`, parse_mode: 'HTML', disable_web_page_preview: true });
     await telegram('sendMessage', { chat_id: message.chat.id, text: `Received *${escapeMarkdown(title)}*.\\nClassification: *${escapeMarkdown(result.type)}*`, parse_mode: 'MarkdownV2' });
   } catch (error) {
     if (PARADOX_ENABLED) await updateParadoxRecord(recordId, { classification: 'Needs inspection', strategy: 'failed' });
-    await telegram('editMessageText', { chat_id: CHANNEL_ID, message_id: metadata.message_id, text: `Title: ${title}\\nType: Needs inspection\\nStrategy: failed\\n[Open PDF](${sourceUrl})`, parse_mode: 'Markdown', disable_web_page_preview: true });
+    await telegram('editMessageText', { chat_id: CHANNEL_ID, message_id: metadata.message_id, text: `<b>Title:</b> ${escapeHtml(title)}\\n<b>Type:</b> Needs inspection\\n<b>Strategy:</b> failed\\n<a href="${sourceUrl}">Open PDF</a>`, parse_mode: 'HTML', disable_web_page_preview: true });
     await telegram('sendMessage', { chat_id: message.chat.id, text: `Received *${escapeMarkdown(title)}*.\\nClassification requires inspection: ${escapeMarkdown(String(error).slice(0, 120))}`, parse_mode: 'MarkdownV2' });
   }
 }
