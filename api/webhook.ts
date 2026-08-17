@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { classifyRemotePdf } from './remote-pdf.js';
-import { listRecords as listParadoxRecords, savePending as saveParadoxPending } from './store.js';
+import { listCategories, listRecords as listParadoxRecords, savePending as saveParadoxPending, type Category as StoredCategory } from './store.js';
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
@@ -49,18 +49,36 @@ const PDFBOT_CALLBACK_SECRET = process.env.PDFBOT_CALLBACK_SECRET || WEBHOOK_SEC
   type: Classification;
   channelUrl: string;
   receivedAt: string;
+  categoryId?: string | null;
   strategy?: string;
   bytesRead?: number;
   pagesSampled?: number;
 };
+
+const BOT_UI = {
+  pageSize: 8,
+  labels: {
+    browse: 'Browse categories',
+    scanned: 'Scanned PDFs',
+    selectable: 'Selectable PDFs',
+    all: 'All PDFs',
+    help: 'Help',
+    home: 'Home',
+    back: 'Back',
+    root: 'Root categories',
+  },
+};
  type TelegramResponseMessage = { message_id: number };
 
-const categoryKeyboard = {
-  inline_keyboard: [[
-    { text: 'Selectable PDFs', callback_data: 'list:Selectable' },
-    { text: 'Scanned PDFs', callback_data: 'list:Scanned' },
-  ]],
-};
+function homeKeyboard() {
+  return { inline_keyboard: [
+    [{ text: `📂 ${BOT_UI.labels.browse}`, callback_data: 'menu:browse' }],
+    [{ text: `📗 ${BOT_UI.labels.selectable}`, callback_data: 'type:Selectable:0' }, { text: `🖼 ${BOT_UI.labels.scanned}`, callback_data: 'type:Scanned:0' }],
+    [{ text: `📚 ${BOT_UI.labels.all}`, callback_data: 'type:all:0' }, { text: `❔ ${BOT_UI.labels.help}`, callback_data: 'menu:help' }],
+  ] };
+}
+
+const categoryKeyboard = homeKeyboard();
 
 async function telegram<T>(method: string, body: Record<string, unknown>): Promise<T> {
   const response = await fetch(`${TELEGRAM_API_URL}/${method}`, {
@@ -121,6 +139,7 @@ async function readGithubLog(): Promise<{ entries: RecordEntry[]; sha?: string }
         type: record.classification,
         channelUrl: record.source_url,
         receivedAt: record.received_at,
+        categoryId: record.category_id,
         strategy: record.strategy,
         bytesRead: record.bytes_read,
         pagesSampled: record.pages_sampled,
@@ -180,43 +199,82 @@ async function writeGithubLog(entries: RecordEntry[], sha?: string): Promise<voi
   if (!response.ok) throw new Error(`GitHub write failed: ${response.status} ${(await response.text()).slice(0, 300)}`);
 }
 
-async function sendCategoryList(chatId: number, type: 'Scanned' | 'Selectable'): Promise<void> {
+async function sendHome(chatId: number, editMessageId?: number): Promise<void> {
+  const text = '<b>PDF Library</b>\n\nChoose an action below, or send me a PDF to classify and archive it.';
+  if (editMessageId) {
+    await telegram('editMessageText', { chat_id: chatId, message_id: editMessageId, text, parse_mode: 'HTML', reply_markup: homeKeyboard() });
+  } else {
+    await telegram('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', reply_markup: homeKeyboard() });
+  }
+}
+
+async function sendHelp(chatId: number, editMessageId?: number): Promise<void> {
+  const text = '<b>How to use PDF Library</b>\n\n• Send a PDF to classify and forward it.\n• Browse categories to open nested folders.\n• Use Scanned, Selectable, or All PDFs to browse by type.\n• Use /menu to reopen this menu.\n• Use /categories to open the category tree.';
+  const markup = { inline_keyboard: [[{ text: `↩ ${BOT_UI.labels.home}`, callback_data: 'menu:home' }]] };
+  if (editMessageId) await telegram('editMessageText', { chat_id: chatId, message_id: editMessageId, text, parse_mode: 'HTML', reply_markup: markup });
+  else await telegram('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', reply_markup: markup });
+}
+
+function pageKeyboard(prefix: string, page: number, pageCount: number, backData = 'menu:home') {
+  const row: Array<{ text: string; callback_data: string }> = [];
+  if (page > 0) row.push({ text: '‹ Previous', callback_data: `${prefix}:${page - 1}` });
+  if (page + 1 < pageCount) row.push({ text: 'Next ›', callback_data: `${prefix}:${page + 1}` });
+  const rows = row.length ? [row] : [];
+  rows.push([{ text: `↩ ${BOT_UI.labels.back}`, callback_data: backData }, { text: `⌂ ${BOT_UI.labels.home}`, callback_data: 'menu:home' }]);
+  return { inline_keyboard: rows };
+}
+
+async function sendRecordPage(chatId: number, entries: RecordEntry[], title: string, page: number, prefix: string, backData = 'menu:home', editMessageId?: number): Promise<void> {
+  const pageCount = Math.max(1, Math.ceil(entries.length / BOT_UI.pageSize));
+  const safePage = Math.min(Math.max(page, 0), pageCount - 1);
+  const pageEntries = entries.slice(safePage * BOT_UI.pageSize, (safePage + 1) * BOT_UI.pageSize);
+  const body = pageEntries.length
+    ? pageEntries.map((entry, index) => `${safePage * BOT_UI.pageSize + index + 1}. <a href="${escapeHtml(entry.channelUrl)}">${escapeHtml(truncate(entry.title, 150))}</a>\n   ${escapeHtml(truncate(entry.sender, 100))} · ${escapeHtml(entry.type)}`).join('\n\n')
+    : 'No PDFs found in this view.';
+  const text = `<b>${escapeHtml(title)}</b>\n\n${body}\n\nPage ${safePage + 1}/${pageCount} · ${entries.length} PDF(s)`;
+  const payload = { chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: pageKeyboard(prefix, safePage, pageCount, backData) };
+  if (editMessageId) await telegram('editMessageText', { ...payload, message_id: editMessageId });
+  else await telegram('sendMessage', payload);
+}
+
+async function sendTypeList(chatId: number, type: 'Scanned' | 'Selectable' | 'all', page = 0, editMessageId?: number): Promise<void> {
   const { entries } = await readGithubLog();
-  const filtered = entries.filter((entry) => entry.type === type).reverse();
-  if (!filtered.length) {
-    await telegram('sendMessage', {
-      chat_id: chatId,
-      text: `No ${type.toLowerCase()} PDFs have been recorded yet.`,
-      reply_markup: categoryKeyboard,
-    });
+  const filtered = type === 'all' ? entries : entries.filter((entry) => entry.type === type);
+  await sendRecordPage(chatId, filtered.reverse(), type === 'all' ? BOT_UI.labels.all : `${type} PDFs`, page, `type:${type}`, 'menu:home', editMessageId);
+}
+
+async function sendCategoryBrowser(chatId: number, parentId: string | null, editMessageId?: number): Promise<void> {
+  if (!PARADOX_ENABLED) {
+    const text = 'Nested categories require Paradox-DB to be enabled.';
+    if (editMessageId) await telegram('editMessageText', { chat_id: chatId, message_id: editMessageId, text, reply_markup: homeKeyboard() });
+    else await telegram('sendMessage', { chat_id: chatId, text, reply_markup: homeKeyboard() });
     return;
   }
+  const categories = await listCategories();
+  const current = parentId ? categories.find((category) => category.id === parentId) : undefined;
+  const children = categories.filter((category) => (category.parent_id || null) === parentId);
+  const { entries } = await readGithubLog();
+  const inFolder = entries.filter((entry) => (entry.categoryId || null) === parentId);
+  const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+  for (let index = 0; index < children.length; index += 2) {
+    rows.push(children.slice(index, index + 2).map((category) => ({ text: `📁 ${truncate(category.name, 28)}`, callback_data: `cat:${category.id}` })));
+  }
+  if (inFolder.length) rows.push([{ text: `📄 PDFs in this folder (${inFolder.length})`, callback_data: `catpage:${parentId || 'root'}:0` }]);
+  if (parentId) rows.push([{ text: `↩ ${BOT_UI.labels.back}`, callback_data: current?.parent_id ? `cat:${current.parent_id}` : 'menu:browse' }, { text: `⌂ ${BOT_UI.labels.home}`, callback_data: 'menu:home' }]);
+  else rows.push([{ text: `⌂ ${BOT_UI.labels.home}`, callback_data: 'menu:home' }]);
+  const title = current ? `📂 ${current.name}` : `📂 ${BOT_UI.labels.root}`;
+  const text = `<b>${escapeHtml(title)}</b>\n\n${children.length ? 'Choose a subcategory:' : 'No subcategories here yet.'}${inFolder.length ? `\nThis folder contains ${inFolder.length} PDF(s).` : ''}`;
+  const payload = { chat_id: chatId, text, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
+  if (editMessageId) await telegram('editMessageText', { ...payload, message_id: editMessageId });
+  else await telegram('sendMessage', payload);
+}
 
-  const header = `<b>${type} PDFs</b>\n\n`;
-  const lines = filtered.map((entry, index) => `${index + 1}. <a href="${escapeHtml(entry.channelUrl)}">${escapeHtml(truncate(entry.title, 180))}</a> — ${escapeHtml(truncate(entry.sender, 120))}`);
-  let chunk = header;
-  for (const line of lines) {
-    if (chunk.length + line.length + 1 > 3800) {
-      await telegram('sendMessage', {
-        chat_id: chatId,
-        text: chunk,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-        reply_markup: categoryKeyboard,
-      });
-      chunk = '';
-    }
-    chunk += `${line}\n`;
-  }
-  if (chunk) {
-    await telegram('sendMessage', {
-      chat_id: chatId,
-      text: chunk,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      reply_markup: categoryKeyboard,
-    });
-  }
+async function sendCategoryRecords(chatId: number, categoryId: string | null, page: number, editMessageId?: number): Promise<void> {
+  const categories = PARADOX_ENABLED ? await listCategories() : [];
+  const category = categoryId ? categories.find((item) => item.id === categoryId) : undefined;
+  const { entries } = await readGithubLog();
+  const filtered = entries.filter((entry) => (entry.categoryId || null) === categoryId).reverse();
+  await sendRecordPage(chatId, filtered, category ? `📂 ${category.name}` : `📂 ${BOT_UI.labels.root}`, page, `catpage:${categoryId || 'root'}`, category?.parent_id ? `cat:${category.parent_id}` : 'menu:browse', editMessageId);
 }
 
 function classificationResultText(title: string, result: { type: Classification; strategy: string; pagesSampled: number }): string {
@@ -362,13 +420,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   try {
     const update = req.body as TelegramUpdate;
-    if (update.callback_query?.data?.startsWith('list:')) {
-      const requestedType = update.callback_query.data.slice(5);
-      if (requestedType !== 'Scanned' && requestedType !== 'Selectable') {
-        await telegram('answerCallbackQuery', { callback_query_id: update.callback_query.id, text: 'Unknown category.' });
-      } else {
-        await telegram('answerCallbackQuery', { callback_query_id: update.callback_query.id });
-        if (update.callback_query.message) await sendCategoryList(update.callback_query.message.chat.id, requestedType);
+    if (update.callback_query?.data) {
+      const query = update.callback_query;
+      const data = query.data || '';
+      const chatId = query.message?.chat.id;
+      await telegram('answerCallbackQuery', { callback_query_id: query.id });
+      if (!chatId) return res.status(200).json({ ok: true });
+      if (data === 'menu:home') await sendHome(chatId, query.message?.message_id);
+      else if (data === 'menu:help') await sendHelp(chatId, query.message?.message_id);
+      else if (data === 'menu:browse') await sendCategoryBrowser(chatId, null, query.message?.message_id);
+      else if (data.startsWith('type:')) {
+        const [, requestedType, pageText] = data.split(':');
+        const requested = requestedType === 'Scanned' || requestedType === 'Selectable' || requestedType === 'all' ? requestedType : 'all';
+        await sendTypeList(chatId, requested, Number(pageText) || 0, query.message?.message_id);
+      } else if (data.startsWith('catpage:')) {
+        const [, categoryText, pageText] = data.split(':');
+        await sendCategoryRecords(chatId, categoryText === 'root' ? null : categoryText, Number(pageText) || 0, query.message?.message_id);
+      } else if (data.startsWith('cat:')) {
+        await sendCategoryBrowser(chatId, data.slice(4), query.message?.message_id);
+      } else if (data.startsWith('list:')) {
+        const requestedType = data.slice(5) === 'Scanned' ? 'Scanned' : 'Selectable';
+        await sendTypeList(chatId, requestedType, 0, query.message?.message_id);
       }
     } else if (update.message?.document) {
       const mime = update.message.document.mime_type || '';
@@ -377,18 +449,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       else await telegram('sendMessage', { chat_id: update.message.chat.id, text: 'Please send a PDF document.' });
     } else if (update.message?.text === '/scanned' || update.message?.text === '/selectable' || update.message?.text === '/selective') {
       const type = update.message.text === '/scanned' ? 'Scanned' : 'Selectable';
-      await sendCategoryList(update.message.chat.id, type);
-    } else if (update.message?.text === '/start' || update.message?.text === '/help') {
-      await telegram('sendMessage', {
-        chat_id: update.message.chat.id,
-        text: 'Send me a PDF. I will classify it as Selectable or Scanned, forward it to the channel, and let you browse each category with the buttons below.',
-        reply_markup: categoryKeyboard,
-      });
+      await sendTypeList(update.message.chat.id, type, 0);
+    } else if (update.message?.text === '/categories' || update.message?.text === '/browse') {
+      await sendCategoryBrowser(update.message.chat.id, null);
+    } else if (update.message?.text === '/menu' || update.message?.text === '/start') {
+      await sendHome(update.message.chat.id);
+    } else if (update.message?.text === '/help') {
+      await sendHelp(update.message.chat.id);
     } else if (update.message) {
       await telegram('sendMessage', {
         chat_id: update.message.chat.id,
         text: 'Send me a PDF and I will classify it as Selectable or Scanned.',
-        reply_markup: categoryKeyboard,
+        reply_markup: homeKeyboard(),
       });
     }
     return res.status(200).json({ ok: true });
