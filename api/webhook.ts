@@ -18,6 +18,9 @@ const PDFBOT_WORKER_URL = process.env.PDFBOT_WORKER_URL?.replace(/\/$/, '');
 const PDFBOT_WORKER_SECRET = process.env.PDFBOT_WORKER_SECRET;
 const PDFBOT_CALLBACK_URL = process.env.PDFBOT_CALLBACK_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}/api/worker-callback` : undefined);
 const PDFBOT_CALLBACK_SECRET = process.env.PDFBOT_CALLBACK_SECRET || WEBHOOK_SECRET;
+const FORWARD_MAX_RETRIES = Math.max(1, Number(process.env.PDFBOT_FORWARD_MAX_RETRIES || 5));
+const FORWARD_BASE_DELAY_MS = Math.max(250, Number(process.env.PDFBOT_FORWARD_BASE_DELAY_MS || 1500));
+const FORWARD_QUEUE_LIMIT = Math.max(1, Number(process.env.PDFBOT_FORWARD_QUEUE_LIMIT || 100));
 
  type TelegramUser = { id: number; first_name?: string; last_name?: string; username?: string };
  type TelegramDocument = { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
@@ -435,24 +438,48 @@ type WorkerContext = {
 
 type ClassificationResult = { type: Classification; strategy: string; bytesRead: number; pagesSampled: number; reason?: string };
 
-async function finishDocument(context: WorkerContext, result: ClassificationResult): Promise<void> {
-  await updateUserResult(context.chatId, context.progressMessageId, context.title, result);
-  let copied: TelegramResponseMessage;
-  try {
-    copied = await telegram<TelegramResponseMessage>('copyMessage', { chat_id: CHANNEL_ID, from_chat_id: context.chatId, message_id: context.sourceMessageId });
-  } catch (error) {
-    console.error('Channel forwarding failed:', error);
-    await telegram('sendMessage', { chat_id: context.chatId, text: 'The PDF was classified, but I could not forward it to the configured channel. Please verify the channel ID and bot administrator permissions.' });
-    return;
+type ForwardJob = { context: WorkerContext; result: ClassificationResult };
+const forwardQueue: ForwardJob[] = [];
+const forwardQueuedIds = new Set<string>();
+let forwardQueueRunning = false;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function enqueueForward(job: ForwardJob): boolean {
+  if (forwardQueuedIds.has(job.context.recordId)) return true;
+  if (forwardQueue.length >= FORWARD_QUEUE_LIMIT) return false;
+  forwardQueue.push(job);
+  forwardQueuedIds.add(job.context.recordId);
+  void drainForwardQueue();
+  return true;
+}
+
+async function processForwardJob({ context, result }: ForwardJob): Promise<void> {
+  if (!CHANNEL_ID) throw new Error('TELEGRAM_CHANNEL_ID is not configured');
+  let copied: TelegramResponseMessage | undefined;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= FORWARD_MAX_RETRIES; attempt += 1) {
+    try {
+      copied = await telegram<TelegramResponseMessage>('copyMessage', { chat_id: CHANNEL_ID, from_chat_id: context.chatId, message_id: context.sourceMessageId });
+      break;
+    } catch (error) {
+      lastError = error;
+      if (attempt < FORWARD_MAX_RETRIES) await sleep(FORWARD_BASE_DELAY_MS * 2 ** (attempt - 1));
+    }
   }
+  if (!copied) throw lastError instanceof Error ? lastError : new Error('Channel forwarding failed');
+
   const sourceUrl = channelMessageUrl(copied.message_id);
   const caption = [
     `<b>Title:</b> ${escapeHtml(truncate(context.title, 400))}`,
     `<b>Type:</b> ${escapeHtml(result.type)}`,
     `<b>Sender:</b> ${escapeHtml(truncate(context.sender, 250))}`,
     `<b>Strategy:</b> ${escapeHtml(result.strategy)}`,
+    context.categoryId ? `<b>Category:</b> ${escapeHtml(context.categoryId)}` : '',
     `<a href="${escapeHtml(sourceUrl)}">Open PDF</a>`,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
   try {
     await telegram('editMessageCaption', { chat_id: CHANNEL_ID, message_id: copied.message_id, caption, parse_mode: 'HTML', reply_markup: categoryKeyboard });
   } catch (error) {
@@ -460,18 +487,46 @@ async function finishDocument(context: WorkerContext, result: ClassificationResu
   }
   const entry: RecordEntry = {
     id: context.recordId, title: context.title, sender: context.sender, senderId: context.senderId,
-    type: result.type, channelUrl: sourceUrl, receivedAt: new Date().toISOString(),
+    type: result.type, channelUrl: sourceUrl, receivedAt: new Date().toISOString(), categoryId: context.categoryId,
     strategy: result.strategy, bytesRead: result.bytesRead, pagesSampled: result.pagesSampled,
   };
+  if (PARADOX_ENABLED) {
+    await saveParadoxPending({ id: context.recordId, title: context.title, sender: context.sender, sender_id: context.senderId, classification: result.type, source_url: sourceUrl, received_at: entry.receivedAt, strategy: result.strategy, bytes_read: result.bytesRead, pages_sampled: result.pagesSampled, metadata_message_id: copied.message_id, category_id: context.categoryId });
+  } else {
+    const log = await readGithubLog();
+    await writeGithubLog([...log.entries, entry], log.sha);
+  }
+  await telegram('sendMessage', { chat_id: context.chatId, text: `Forwarded successfully. The PDF is now indexed in the channel.\nQueue completed: ${context.title}`, reply_markup: categoryKeyboard });
+}
+
+async function drainForwardQueue(): Promise<void> {
+  if (forwardQueueRunning) return;
+  forwardQueueRunning = true;
   try {
-    if (PARADOX_ENABLED) {
-      await saveParadoxPending({ id: context.recordId, title: context.title, sender: context.sender, sender_id: context.senderId, classification: result.type, source_url: sourceUrl, received_at: entry.receivedAt, strategy: result.strategy, bytes_read: result.bytesRead, pages_sampled: result.pagesSampled, metadata_message_id: copied.message_id, category_id: context.categoryId });
-    } else {
-      const log = await readGithubLog();
-      await writeGithubLog([...log.entries, entry], log.sha);
+    while (forwardQueue.length) {
+      const job = forwardQueue.shift()!;
+      try {
+        await processForwardJob(job);
+      } catch (error) {
+        console.error('Queued channel forwarding failed:', error);
+        await telegram('sendMessage', { chat_id: job.context.chatId, text: `Forwarding failed after ${FORWARD_MAX_RETRIES} attempts. The PDF remains classified, but it was not copied to the channel. Please check channel permissions and retry the queued item later.`, reply_markup: categoryKeyboard }).catch((notificationError) => console.error('Forward failure notification failed:', notificationError));
+      } finally {
+        forwardQueuedIds.delete(job.context.recordId);
+      }
     }
-  } catch (error) {
-    console.error('PDF record persistence failed:', error);
+  } finally {
+    forwardQueueRunning = false;
+    if (forwardQueue.length) void drainForwardQueue();
+  }
+}
+
+async function finishDocument(context: WorkerContext, result: ClassificationResult): Promise<void> {
+  await updateUserResult(context.chatId, context.progressMessageId, context.title, result);
+  const queued = enqueueForward({ context, result });
+  if (queued) {
+    await telegram('sendMessage', { chat_id: context.chatId, text: `Classification complete. Forwarding queued (position ${forwardQueue.length}). The channel copy will be retried automatically if Telegram is busy.`, reply_markup: categoryKeyboard });
+  } else {
+    await telegram('sendMessage', { chat_id: context.chatId, text: 'Classification complete, but the forwarding queue is currently full. The PDF was not forwarded; please retry after the queue drains.', reply_markup: categoryKeyboard });
   }
 }
 
