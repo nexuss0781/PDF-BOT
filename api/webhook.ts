@@ -123,10 +123,31 @@ async function processDocument(message: TelegramMessage): Promise<void> {
   const document = message.document!;
   const title = document.file_name || 'Untitled PDF';
   const recordId = `${Date.now()}-${message.message_id}`;
+  const sender = senderName(message.from);
   const botKeyboard = { inline_keyboard: [[{ text: 'Scanned', callback_data: 'list:Scanned' }, { text: 'Selectable', callback_data: 'list:Selectable' }]] };
-  // Telegram copies the original document server-side; the Vercel app does not re-upload it.
+
+  let result: { type: RecordEntry['type']; strategy: string; bytesRead: number; pagesSampled: number };
+  try {
+    const file = await telegram<{ file_path: string }>('getFile', { file_id: document.file_id });
+    result = await classifyRemotePdf(document, file.file_path);
+  } catch (error) {
+    console.error('PDF classification failed:', error);
+    result = { type: 'Needs inspection', strategy: 'failed', bytesRead: 0, pagesSampled: 0 };
+  }
+
+  // Report the intended result to the user before attempting the channel operation.
+  await telegram('sendMessage', {
+    chat_id: message.chat.id,
+    text: result.type === 'Needs inspection'
+      ? `Received *${escapeMarkdown(title)}*.\\nClassification: *Needs inspection*.\\nThe PDF could not be classified completely.`
+      : `Received *${escapeMarkdown(title)}*.\\nClassification: *${escapeMarkdown(result.type)}*.\\nChoose a category to list matching PDFs from the channel.`,
+    parse_mode: 'MarkdownV2',
+    reply_markup: botKeyboard,
+  });
+
   let copied: { message_id: number };
   try {
+    // Telegram copies the original document server-side; Vercel does not re-upload it.
     copied = await telegram<{ message_id: number }>('copyMessage', {
       chat_id: CHANNEL_ID,
       from_chat_id: message.chat.id,
@@ -136,43 +157,45 @@ async function processDocument(message: TelegramMessage): Promise<void> {
     console.error('Channel forwarding failed:', error);
     await telegram('sendMessage', {
       chat_id: message.chat.id,
-      text: 'I received your PDF, but I could not forward it to the configured channel. Please verify TELEGRAM_CHANNEL_ID and make sure this bot is an administrator of that channel with permission to post messages.',
+      text: 'The PDF was classified, but I could not forward it to the configured channel. Please verify TELEGRAM_CHANNEL_ID and the bot administrator permissions.',
     });
     return;
   }
+
   const sourceUrl = channelMessageUrl(copied.message_id);
-  const metadata = await telegram<{ message_id: number }>('sendMessage', {
-    chat_id: CHANNEL_ID,
-    text: `<b>Title:</b> ${escapeHtml(title)}\\n<b>Type:</b> Processing\\n<b>Sender:</b> ${escapeHtml(senderName(message.from))}\\n<a href="${sourceUrl}">Open PDF</a>`,
-    parse_mode: 'HTML',
-    disable_web_page_preview: true,
-  });
+  const caption = `<b>Title:</b> ${escapeHtml(title)}\\n<b>Type:</b> ${escapeHtml(result.type)}\\n<b>Sender:</b> ${escapeHtml(sender)}\\n<b>Strategy:</b> ${escapeHtml(result.strategy)}\\n<a href="${sourceUrl}">Open PDF</a>`;
+  try {
+    await telegram('editMessageCaption', {
+      chat_id: CHANNEL_ID,
+      message_id: copied.message_id,
+      caption,
+      parse_mode: 'HTML',
+    });
+  } catch (error) {
+    console.error('Channel caption update failed:', error);
+  }
+
   const entry: RecordEntry = {
     id: recordId,
     title,
-    sender: senderName(message.from),
+    sender,
     senderId: message.from?.id || 0,
-    type: 'Needs inspection',
+    type: result.type,
     channelUrl: sourceUrl,
     receivedAt: new Date().toISOString(),
-    strategy: 'queued',
+    strategy: result.strategy,
+    bytesRead: result.bytesRead,
+    pagesSampled: result.pagesSampled,
   };
-  const log = await readGithubLog();
-  if (PARADOX_ENABLED) {
-    await saveParadoxPending({ id: recordId, title, sender: entry.sender, sender_id: entry.senderId, classification: 'Needs inspection', source_url: sourceUrl, received_at: entry.receivedAt, strategy: 'queued', metadata_message_id: metadata.message_id });
-  } else {
-    await writeGithubLog([...log.entries, entry], log.sha);
-  }
   try {
-    const file = await telegram<{ file_path: string }>('getFile', { file_id: document.file_id });
-    const result = await classifyRemotePdf(document, file.file_path);
-    if (PARADOX_ENABLED) await updateParadoxRecord(recordId, { classification: result.type, strategy: result.strategy, bytes_read: result.bytesRead, pages_sampled: result.pagesSampled });
-    await telegram('editMessageText', { chat_id: CHANNEL_ID, message_id: metadata.message_id, text: `<b>Title:</b> ${escapeHtml(title)}\\n<b>Type:</b> ${escapeHtml(result.type)}\\n<b>Strategy:</b> ${escapeHtml(result.strategy)}\\n<a href="${sourceUrl}">Open PDF</a>`, parse_mode: 'HTML', disable_web_page_preview: true });
-    await telegram('sendMessage', { chat_id: message.chat.id, text: `Received *${escapeMarkdown(title)}*.\\nClassification: *${escapeMarkdown(result.type)}*\\nChoose a category to list matching PDFs from the channel.`, parse_mode: 'MarkdownV2', reply_markup: botKeyboard });
+    if (PARADOX_ENABLED) {
+      await saveParadoxPending({ id: recordId, title, sender, sender_id: entry.senderId, classification: result.type, source_url: sourceUrl, received_at: entry.receivedAt, strategy: result.strategy, bytes_read: result.bytesRead, pages_sampled: result.pagesSampled, metadata_message_id: copied.message_id });
+    } else {
+      const log = await readGithubLog();
+      await writeGithubLog([...log.entries, entry], log.sha);
+    }
   } catch (error) {
-    if (PARADOX_ENABLED) await updateParadoxRecord(recordId, { classification: 'Needs inspection', strategy: 'failed' });
-    await telegram('editMessageText', { chat_id: CHANNEL_ID, message_id: metadata.message_id, text: `<b>Title:</b> ${escapeHtml(title)}\\n<b>Type:</b> Needs inspection\\n<b>Strategy:</b> failed\\n<a href="${sourceUrl}">Open PDF</a>`, parse_mode: 'HTML', disable_web_page_preview: true });
-    await telegram('sendMessage', { chat_id: message.chat.id, text: `Received *${escapeMarkdown(title)}*.\\nClassification requires inspection: ${escapeMarkdown(String(error).slice(0, 120))}`, parse_mode: 'MarkdownV2' });
+    console.error('PDF record persistence failed:', error);
   }
 }
 
