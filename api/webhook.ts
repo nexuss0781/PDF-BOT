@@ -12,6 +12,10 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_REPO = process.env.GITHUB_REPO;
 const GITHUB_LOG_PATH = process.env.GITHUB_LOG_PATH || 'data/pdf-dashboard.md';
 const TELEGRAM_API_URL = `${TELEGRAM_API_BASE}${BOT_TOKEN || ''}`;
+const PDFBOT_WORKER_URL = process.env.PDFBOT_WORKER_URL?.replace(/\/$/, '');
+const PDFBOT_WORKER_SECRET = process.env.PDFBOT_WORKER_SECRET;
+const PDFBOT_CALLBACK_URL = process.env.PDFBOT_CALLBACK_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}/api/worker-callback` : undefined);
+const PDFBOT_CALLBACK_SECRET = process.env.PDFBOT_CALLBACK_SECRET || WEBHOOK_SECRET;
 
  type TelegramUser = { id: number; first_name?: string; last_name?: string; username?: string };
  type TelegramDocument = { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
@@ -247,21 +251,80 @@ async function updateUserResult(chatId: number, progressMessageId: number, title
   }
 }
 
+type WorkerContext = {
+  chatId: number;
+  progressMessageId: number;
+  sourceMessageId: number;
+  senderId: number;
+  title: string;
+  sender: string;
+  recordId: string;
+};
+
+type ClassificationResult = { type: Classification; strategy: string; bytesRead: number; pagesSampled: number; reason?: string };
+
+async function finishDocument(context: WorkerContext, result: ClassificationResult): Promise<void> {
+  await updateUserResult(context.chatId, context.progressMessageId, context.title, result);
+  let copied: TelegramResponseMessage;
+  try {
+    copied = await telegram<TelegramResponseMessage>('copyMessage', { chat_id: CHANNEL_ID, from_chat_id: context.chatId, message_id: context.sourceMessageId });
+  } catch (error) {
+    console.error('Channel forwarding failed:', error);
+    await telegram('sendMessage', { chat_id: context.chatId, text: 'The PDF was classified, but I could not forward it to the configured channel. Please verify the channel ID and bot administrator permissions.' });
+    return;
+  }
+  const sourceUrl = channelMessageUrl(copied.message_id);
+  const caption = [
+    `<b>Title:</b> ${escapeHtml(truncate(context.title, 400))}`,
+    `<b>Type:</b> ${escapeHtml(result.type)}`,
+    `<b>Sender:</b> ${escapeHtml(truncate(context.sender, 250))}`,
+    `<b>Strategy:</b> ${escapeHtml(result.strategy)}`,
+    `<a href="${escapeHtml(sourceUrl)}">Open PDF</a>`,
+  ].join('\n');
+  try {
+    await telegram('editMessageCaption', { chat_id: CHANNEL_ID, message_id: copied.message_id, caption, parse_mode: 'HTML', reply_markup: categoryKeyboard });
+  } catch (error) {
+    console.error('Channel caption or button update failed:', error);
+  }
+  const entry: RecordEntry = {
+    id: context.recordId, title: context.title, sender: context.sender, senderId: context.senderId,
+    type: result.type, channelUrl: sourceUrl, receivedAt: new Date().toISOString(),
+    strategy: result.strategy, bytesRead: result.bytesRead, pagesSampled: result.pagesSampled,
+  };
+  try {
+    if (PARADOX_ENABLED) {
+      await saveParadoxPending({ id: context.recordId, title: context.title, sender: context.sender, sender_id: context.senderId, classification: result.type, source_url: sourceUrl, received_at: entry.receivedAt, strategy: result.strategy, bytes_read: result.bytesRead, pages_sampled: result.pagesSampled, metadata_message_id: copied.message_id });
+    } else {
+      const log = await readGithubLog();
+      await writeGithubLog([...log.entries, entry], log.sha);
+    }
+  } catch (error) {
+    console.error('PDF record persistence failed:', error);
+  }
+}
+
 async function processDocument(message: TelegramMessage): Promise<void> {
   const document = message.document!;
   const title = document.file_name || 'Untitled PDF';
-  const recordId = `${Date.now()}-${message.message_id}`;
-  const sender = senderName(message.from);
+  const context: WorkerContext = { chatId: message.chat.id, progressMessageId: 0, sourceMessageId: message.message_id, senderId: message.from?.id || 0, title, sender: senderName(message.from), recordId: `${Date.now()}-${message.message_id}` };
+  const progress = await telegram<TelegramResponseMessage>('sendMessage', { chat_id: message.chat.id, text: `<b>${escapeHtml(truncate(title, 180))}</b>\n\nPDF received. I am checking whether it is selectable or scanned…`, parse_mode: 'HTML', reply_markup: categoryKeyboard });
+  context.progressMessageId = progress.message_id;
 
-  // This message is sent before any remote PDF inspection, so the bot acknowledges the upload immediately.
-  const progress = await telegram<TelegramResponseMessage>('sendMessage', {
-    chat_id: message.chat.id,
-    text: `<b>${escapeHtml(truncate(title, 180))}</b>\n\nPDF received. I am checking whether it is selectable or scanned…`,
-    parse_mode: 'HTML',
-    reply_markup: categoryKeyboard,
-  });
+  if (PDFBOT_WORKER_URL && PDFBOT_CALLBACK_URL) {
+    try {
+      const response = await fetch(`${PDFBOT_WORKER_URL}/pdfbot/classify`, {
+        method: 'POST', headers: { 'content-type': 'application/json', ...(PDFBOT_WORKER_SECRET ? { 'x-pdfbot-worker-secret': PDFBOT_WORKER_SECRET } : {}) },
+        body: JSON.stringify({ bot_token: BOT_TOKEN, file_id: document.file_id, job_id: context.recordId, callback_url: PDFBOT_CALLBACK_URL, callback_secret: PDFBOT_CALLBACK_SECRET, context }),
+      });
+      if (!response.ok) throw new Error(`Worker dispatch failed: ${response.status}`);
+      await telegram('editMessageText', { chat_id: message.chat.id, message_id: progress.message_id, text: `<b>${escapeHtml(truncate(title, 180))}</b>\n\nReceived. Uploading to the local processing server…`, parse_mode: 'HTML', reply_markup: categoryKeyboard });
+      return;
+    } catch (error) {
+      console.error('Isolated worker unavailable; using fallback:', error);
+    }
+  }
 
-  let result: { type: Classification; strategy: string; bytesRead: number; pagesSampled: number; reason?: string };
+  let result: ClassificationResult;
   try {
     const file = await telegram<{ file_path: string }>('getFile', { file_id: document.file_id });
     result = await classifyRemotePdf(document, file.file_path);
@@ -269,80 +332,25 @@ async function processDocument(message: TelegramMessage): Promise<void> {
     console.error('PDF classification failed:', error);
     result = { type: 'Needs inspection', strategy: 'failed', bytesRead: 0, pagesSampled: 0, reason: String(error).slice(0, 240) };
   }
+  await finishDocument(context, result);
+}
 
-  // The user sees the final category before the channel forwarding operation starts.
-  await updateUserResult(message.chat.id, progress.message_id, title, result);
-
-  let copied: TelegramResponseMessage;
+export async function workerCallbackHandler(req: VercelRequest, res: VercelResponse) {
+  if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'Method not allowed' });
+  if (PDFBOT_CALLBACK_SECRET && req.headers['x-pdfbot-worker-secret'] !== PDFBOT_CALLBACK_SECRET) return res.status(401).json({ ok: false, error: 'Unauthorized' });
   try {
-    // Telegram copies the original document server-side; the application does not re-upload the PDF.
-    copied = await telegram<TelegramResponseMessage>('copyMessage', {
-      chat_id: CHANNEL_ID,
-      from_chat_id: message.chat.id,
-      message_id: message.message_id,
-    });
-  } catch (error) {
-    console.error('Channel forwarding failed:', error);
-    await telegram('sendMessage', {
-      chat_id: message.chat.id,
-      text: 'The PDF was classified, but I could not forward it to the configured channel. Please verify the channel ID and bot administrator permissions.',
-    });
-    return;
-  }
-
-  const sourceUrl = channelMessageUrl(copied.message_id);
-  const caption = [
-    `<b>Title:</b> ${escapeHtml(truncate(title, 400))}`,
-    `<b>Type:</b> ${escapeHtml(result.type)}`,
-    `<b>Sender:</b> ${escapeHtml(truncate(sender, 250))}`,
-    `<b>Strategy:</b> ${escapeHtml(result.strategy)}`,
-    `<a href="${escapeHtml(sourceUrl)}">Open PDF</a>`,
-  ].join('\n');
-  try {
-    await telegram('editMessageCaption', {
-      chat_id: CHANNEL_ID,
-      message_id: copied.message_id,
-      caption,
-      parse_mode: 'HTML',
-      reply_markup: categoryKeyboard,
-    });
-  } catch (error) {
-    console.error('Channel caption or button update failed:', error);
-  }
-
-  const entry: RecordEntry = {
-    id: recordId,
-    title,
-    sender,
-    senderId: message.from?.id || 0,
-    type: result.type,
-    channelUrl: sourceUrl,
-    receivedAt: new Date().toISOString(),
-    strategy: result.strategy,
-    bytesRead: result.bytesRead,
-    pagesSampled: result.pagesSampled,
-  };
-  try {
-    if (PARADOX_ENABLED) {
-      await saveParadoxPending({
-        id: recordId,
-        title,
-        sender,
-        sender_id: entry.senderId,
-        classification: result.type,
-        source_url: sourceUrl,
-        received_at: entry.receivedAt,
-        strategy: result.strategy,
-        bytes_read: result.bytesRead,
-        pages_sampled: result.pagesSampled,
-        metadata_message_id: copied.message_id,
-      });
+    const payload = req.body as { status?: string; stage?: string; message?: string; classification?: Classification; strategy?: string; bytes_read?: number; pages_sampled?: number; context?: WorkerContext };
+    const context = payload.context;
+    if (!context) return res.status(400).json({ ok: false, error: 'Missing worker context' });
+    if (payload.status === 'processing') {
+      await telegram('editMessageText', { chat_id: context.chatId, message_id: context.progressMessageId, text: `<b>${escapeHtml(truncate(context.title, 180))}</b>\n\n${escapeHtml(payload.message || payload.stage || 'Processing…')}`, parse_mode: 'HTML', reply_markup: categoryKeyboard });
     } else {
-      const log = await readGithubLog();
-      await writeGithubLog([...log.entries, entry], log.sha);
+      await finishDocument(context, { type: payload.classification || 'Needs inspection', strategy: payload.strategy || 'local-worker', bytesRead: payload.bytes_read || 0, pagesSampled: payload.pages_sampled || 0 });
     }
+    return res.status(200).json({ ok: true });
   } catch (error) {
-    console.error('PDF record persistence failed:', error);
+    console.error('Worker callback failed:', error);
+    return res.status(200).json({ ok: true });
   }
 }
 
