@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { classifyRemotePdf } from './remote-pdf.js';
-import { listCategories, listRecords as listParadoxRecords, savePending as saveParadoxPending, type Category as StoredCategory } from './store.js';
+import { createCategory, listCategories, listRecords as listParadoxRecords, moveCategory, savePending as saveParadoxPending, type Category as StoredCategory } from './store.js';
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
@@ -26,6 +26,7 @@ const PDFBOT_CALLBACK_SECRET = process.env.PDFBOT_CALLBACK_SECRET || WEBHOOK_SEC
   from?: TelegramUser;
   document?: TelegramDocument;
   text?: string;
+  reply_to_message?: TelegramMessage;
   date: number;
 };
  type TelegramCallbackQuery = {
@@ -79,6 +80,9 @@ function homeKeyboard() {
 }
 
 const categoryKeyboard = homeKeyboard();
+
+type PendingCategoryAction = { kind: 'create'; parentId: string | null; expiresAt: number };
+const pendingCategoryActions = new Map<number, PendingCategoryAction>();
 
 async function telegram<T>(method: string, body: Record<string, unknown>): Promise<T> {
   const response = await fetch(`${TELEGRAM_API_URL}/${method}`, {
@@ -260,6 +264,7 @@ async function sendCategoryBrowser(chatId: number, parentId: string | null, edit
     rows.push(children.slice(index, index + 2).map((category) => ({ text: `📁 ${truncate(category.name, 28)}`, callback_data: `cat:${category.id}` })));
   }
   if (inFolder.length) rows.push([{ text: `📄 PDFs in this folder (${inFolder.length})`, callback_data: `catpage:${parentId || 'root'}:0` }]);
+  rows.push([{ text: '➕ Create category here', callback_data: `catcreate:${parentId || 'root'}` }, { text: '↔ Move category here', callback_data: `catmove:${parentId || 'root'}` }]);
   if (parentId) rows.push([{ text: `↩ ${BOT_UI.labels.back}`, callback_data: current?.parent_id ? `cat:${current.parent_id}` : 'menu:browse' }, { text: `⌂ ${BOT_UI.labels.home}`, callback_data: 'menu:home' }]);
   else rows.push([{ text: `⌂ ${BOT_UI.labels.home}`, callback_data: 'menu:home' }]);
   const title = current ? `📂 ${current.name}` : `📂 ${BOT_UI.labels.root}`;
@@ -267,6 +272,41 @@ async function sendCategoryBrowser(chatId: number, parentId: string | null, edit
   const payload = { chat_id: chatId, text, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
   if (editMessageId) await telegram('editMessageText', { ...payload, message_id: editMessageId });
   else await telegram('sendMessage', payload);
+}
+
+async function sendMoveCategoryMenu(chatId: number, targetParentId: string | null, editMessageId?: number): Promise<void> {
+  if (!PARADOX_ENABLED) return sendCategoryBrowser(chatId, targetParentId, editMessageId);
+  const categories = await listCategories();
+  const target = targetParentId ? categories.find((category) => category.id === targetParentId) : undefined;
+  const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+  const candidates = categories.filter((category) => category.id !== targetParentId);
+  for (let index = 0; index < candidates.length; index += 2) {
+    rows.push(candidates.slice(index, index + 2).map((category) => ({ text: `📁 ${truncate(category.name, 26)}`, callback_data: `movesource:${category.id}:${targetParentId || 'root'}` })));
+  }
+  rows.push([{ text: 'Cancel', callback_data: targetParentId ? `cat:${targetParentId}` : 'menu:browse' }]);
+  const text = `<b>Move a category into ${escapeHtml(target?.name || BOT_UI.labels.root)}</b>\n\nChoose the category to move. The system will block invalid moves into itself or its descendants.`;
+  const payload = { chat_id: chatId, text, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
+  if (editMessageId) await telegram('editMessageText', { ...payload, message_id: editMessageId });
+  else await telegram('sendMessage', payload);
+}
+
+async function handlePendingCategoryText(message: TelegramMessage): Promise<boolean> {
+  if (!message.text) return false;
+  const pending = pendingCategoryActions.get(message.chat.id);
+  if (!pending) return false;
+  pendingCategoryActions.delete(message.chat.id);
+  if (pending.expiresAt < Date.now() || message.text.trim() === '/cancel') {
+    await telegram('sendMessage', { chat_id: message.chat.id, text: 'Category creation cancelled.', reply_markup: homeKeyboard() });
+    return true;
+  }
+  try {
+    const category = await createCategory(message.text.trim().slice(0, 80), pending.parentId);
+    await telegram('sendMessage', { chat_id: message.chat.id, text: `Created category <b>${escapeHtml(category.name)}</b>.`, parse_mode: 'HTML' });
+    await sendCategoryBrowser(message.chat.id, pending.parentId);
+  } catch (error) {
+    await telegram('sendMessage', { chat_id: message.chat.id, text: `Could not create category: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: homeKeyboard() });
+  }
+  return true;
 }
 
 async function sendCategoryRecords(chatId: number, categoryId: string | null, page: number, editMessageId?: number): Promise<void> {
@@ -429,7 +469,26 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (data === 'menu:home') await sendHome(chatId, query.message?.message_id);
       else if (data === 'menu:help') await sendHelp(chatId, query.message?.message_id);
       else if (data === 'menu:browse') await sendCategoryBrowser(chatId, null, query.message?.message_id);
-      else if (data.startsWith('type:')) {
+      else if (data.startsWith('catcreate:')) {
+        if (!PARADOX_ENABLED) await telegram('sendMessage', { chat_id: chatId, text: 'Category management requires Paradox-DB to be enabled.', reply_markup: homeKeyboard() });
+        else {
+          const parentText = data.slice(10);
+          pendingCategoryActions.set(chatId, { kind: 'create', parentId: parentText === 'root' ? null : parentText, expiresAt: Date.now() + 5 * 60 * 1000 });
+          await telegram('sendMessage', { chat_id: chatId, text: 'Type the new category name. Send /cancel to stop.', reply_markup: { force_reply: true, input_field_placeholder: 'Category name' } });
+        }
+      } else if (data.startsWith('catmove:')) {
+        const targetText = data.slice(8);
+        await sendMoveCategoryMenu(chatId, targetText === 'root' ? null : targetText, query.message?.message_id);
+      } else if (data.startsWith('movesource:')) {
+        const [, sourceId, targetText] = data.split(':');
+        try {
+          await moveCategory(sourceId, targetText === 'root' ? null : targetText);
+          await telegram('sendMessage', { chat_id: chatId, text: 'Category moved successfully.' });
+          await sendCategoryBrowser(chatId, targetText === 'root' ? null : targetText);
+        } catch (error) {
+          await telegram('sendMessage', { chat_id: chatId, text: `Could not move category: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: homeKeyboard() });
+        }
+      } else if (data.startsWith('type:')) {
         const [, requestedType, pageText] = data.split(':');
         const requested = requestedType === 'Scanned' || requestedType === 'Selectable' || requestedType === 'all' ? requestedType : 'all';
         await sendTypeList(chatId, requested, Number(pageText) || 0, query.message?.message_id);
@@ -442,6 +501,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const requestedType = data.slice(5) === 'Scanned' ? 'Scanned' : 'Selectable';
         await sendTypeList(chatId, requestedType, 0, query.message?.message_id);
       }
+    } else if (update.message?.text && await handlePendingCategoryText(update.message)) {
+      // Category creation reply was handled above.
     } else if (update.message?.document) {
       const mime = update.message.document.mime_type || '';
       const filename = update.message.document.file_name || '';
