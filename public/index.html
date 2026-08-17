@@ -3,23 +3,62 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PDF Bot</title>
+  <title>PDF Bot — Category Manager</title>
   <style>
-    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; }
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0f172a; color: #e2e8f0; }
-    main { max-width: 680px; padding: 48px 28px; text-align: center; }
-    h1 { margin-bottom: 12px; font-size: 42px; }
-    p { color: #94a3b8; line-height: 1.6; }
-    code { padding: 4px 8px; border-radius: 6px; background: #1e293b; color: #c4b5fd; }
-    .status { display: inline-block; margin-top: 18px; padding: 8px 14px; border: 1px solid #334155; border-radius: 999px; color: #86efac; }
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; --bg:#08111f; --panel:#101d31; --panel2:#14243b; --line:#263b58; --text:#e7eef8; --muted:#91a4bd; --accent:#63a6ff; --green:#64d6a1; --danger:#ff7d86; }
+    * { box-sizing:border-box; } body { margin:0; min-height:100vh; background:radial-gradient(circle at 20% 0%,#173154 0,#08111f 45%); color:var(--text); }
+    header { padding:28px clamp(18px,4vw,56px) 18px; border-bottom:1px solid var(--line); background:#0b1729cc; backdrop-filter:blur(14px); position:sticky; top:0; z-index:5; }
+    header h1 { margin:0 0 6px; font-size:clamp(24px,3vw,36px); } header p { margin:0; color:var(--muted); }
+    main { display:grid; grid-template-columns:minmax(280px,360px) 1fr; gap:20px; max-width:1480px; margin:0 auto; padding:22px clamp(14px,4vw,56px) 56px; }
+    .panel { background:linear-gradient(160deg,#12233aee,#0d192bee); border:1px solid var(--line); border-radius:18px; box-shadow:0 18px 50px #0003; overflow:hidden; }
+    .panel-head { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:18px 18px 14px; border-bottom:1px solid var(--line); } .panel-head h2 { margin:0; font-size:16px; }
+    .panel-body { padding:16px; } .toolbar { display:flex; gap:8px; flex-wrap:wrap; }
+    input, select, button { border:1px solid var(--line); border-radius:9px; background:#0b1728; color:var(--text); padding:9px 11px; font:inherit; } button { cursor:pointer; } button:hover { border-color:var(--accent); background:#162b48; } button.primary { background:#1b5ca8; border-color:#327bd0; } button.danger { color:#ffabb1; }
+    .create { display:grid; grid-template-columns:1fr; gap:8px; margin-bottom:16px; } .hint { color:var(--muted); font-size:12px; line-height:1.5; }
+    #tree { min-height:220px; } .drop-root { border:1px dashed #3b6594; color:#a9c9ee; padding:11px; border-radius:10px; margin-bottom:10px; text-align:center; } .drop-root.over { background:#183a62; }
+    .tree-node { margin-left:14px; } .tree-row { display:flex; align-items:center; gap:6px; padding:7px; border-radius:8px; margin:2px 0; } .tree-row:hover { background:#162b48; } .tree-row.dragging { opacity:.45; } .tree-row.over { outline:1px solid var(--accent); background:#183a62; }
+    .tree-name { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; } .tree-count { color:var(--muted); font-size:12px; } .tree-actions { display:flex; gap:3px; opacity:.55; } .tree-row:hover .tree-actions { opacity:1; } .icon { padding:4px 6px; font-size:12px; }
+    .record-list { display:grid; gap:10px; } .record { display:grid; grid-template-columns:1fr minmax(150px,220px); gap:12px; align-items:center; padding:13px; border:1px solid var(--line); border-radius:12px; background:#0c192a; } .record-title { font-weight:650; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .record-meta { color:var(--muted); font-size:12px; margin-top:5px; } .record a { color:#8dc4ff; } .empty { padding:34px 16px; color:var(--muted); text-align:center; }
+    .status { color:var(--green); font-size:13px; } .error { color:var(--danger); } @media(max-width:850px){ main{grid-template-columns:1fr;} .record{grid-template-columns:1fr;} }
   </style>
 </head>
 <body>
-  <main>
-    <h1>PDF Bot</h1>
-    <p>The Telegram PDF classification service is deployed and ready for webhook configuration.</p>
-    <p>Webhook endpoint: <code>/api/webhook</code></p>
-    <div class="status">Service online</div>
-  </main>
-</body>
-</html>
+<header><h1>PDF Bot Category Manager</h1><p>Organize scanned and selectable PDFs into nested categories. Drag a category onto another category to move it inside.</p></header>
+<main>
+  <section class="panel"><div class="panel-head"><h2>Categories</h2><span id="status" class="status">Loading…</span></div><div class="panel-body">
+    <div class="create"><input id="categoryName" placeholder="New category name"><select id="categoryParent"><option value="">Create at root</option></select><button class="primary" id="createBtn">Create category</button><div class="hint">Drag category rows to nest them. Deleting a category moves its children to the deleted category’s parent and unassigns its PDFs.</div></div>
+    <div id="rootDrop" class="drop-root">Drop here to move a category to the root</div><div id="tree"></div>
+  </div></section>
+  <section class="panel"><div class="panel-head"><h2>PDFs</h2><button id="refreshBtn">Refresh</button></div><div class="panel-body"><div id="records" class="record-list"></div></div></section>
+</main>
+<script>
+  const state = { categories: [], records: [], dragged: null };
+  const $ = (id) => document.getElementById(id);
+  const esc = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const api = async (payload) => { const r = await fetch('/api/dashboard', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(payload) }); const data = await r.json(); if (!r.ok || !data.ok) throw new Error(data.error || 'Request failed'); return data; };
+  function categoryOptions(selected) { return '<option value="">Unassigned</option>' + state.categories.map(c => `<option value="${esc(c.id)}" ${c.id === selected ? 'selected' : ''}>${esc(c.name)}</option>`).join(''); }
+  function childrenOf(parent) { return state.categories.filter(c => (c.parent_id || null) === (parent || null)); }
+  function recordCount(id) { return state.records.filter(r => r.category_id === id).length; }
+  function renderTree() {
+    $('categoryParent').innerHTML = '<option value="">Create at root</option>' + state.categories.map(c => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('');
+    const render = (parent) => childrenOf(parent).map(c => `<div class="tree-node"><div class="tree-row" draggable="true" data-id="${esc(c.id)}"><span>▣</span><span class="tree-name">${esc(c.name)}</span><span class="tree-count">${recordCount(c.id)}</span><span class="tree-actions"><button class="icon rename" data-id="${esc(c.id)}">Rename</button><button class="icon danger delete" data-id="${esc(c.id)}">×</button></span></div>${render(c.id)}</div>`).join('');
+    $('tree').innerHTML = render(null) || '<div class="empty">No categories yet.</div>';
+    document.querySelectorAll('.tree-row').forEach(row => {
+      row.addEventListener('dragstart', () => { state.dragged = row.dataset.id; row.classList.add('dragging'); });
+      row.addEventListener('dragend', () => { state.dragged = null; row.classList.remove('dragging'); document.querySelectorAll('.over').forEach(x => x.classList.remove('over')); });
+      row.addEventListener('dragover', e => { e.preventDefault(); row.classList.add('over'); });
+      row.addEventListener('dragleave', () => row.classList.remove('over'));
+      row.addEventListener('drop', async e => { e.preventDefault(); row.classList.remove('over'); if (state.dragged && state.dragged !== row.dataset.id) await move(state.dragged, row.dataset.id); });
+    });
+  }
+  function renderRecords() { $('records').innerHTML = state.records.map(r => `<article class="record"><div><div class="record-title"><a href="${esc(r.source_url)}" target="_blank" rel="noreferrer">${esc(r.title)}</a></div><div class="record-meta">${esc(r.classification)} · ${esc(r.sender)} · ${esc(new Date(r.received_at).toLocaleString())}</div></div><select class="assign" data-id="${esc(r.id)}">${categoryOptions(r.category_id)}</select></article>`).join('') || '<div class="empty">No PDFs have been recorded yet.</div>'; }
+  async function load() { try { const r = await fetch('/api/dashboard', {cache:'no-store'}); const data = await r.json(); if (!r.ok || !data.ok) throw new Error(data.error || 'Load failed'); state.categories=data.categories||[]; state.records=data.records||[]; renderTree(); renderRecords(); $('status').textContent = `${state.categories.length} categories · ${state.records.length} PDFs`; $('status').className='status'; } catch(e) { $('status').textContent=e.message; $('status').className='status error'; } }
+  async function move(id, parentId) { try { await api({action:'move-category', id, parentId}); await load(); } catch(e) { alert(e.message); } }
+  $('createBtn').onclick = async () => { try { await api({action:'create-category', name:$('categoryName').value, parentId:$('categoryParent').value || null}); $('categoryName').value=''; await load(); } catch(e) { alert(e.message); } };
+  $('refreshBtn').onclick = load;
+  $('rootDrop').addEventListener('dragover', e => { e.preventDefault(); $('rootDrop').classList.add('over'); }); $('rootDrop').addEventListener('dragleave', () => $('rootDrop').classList.remove('over')); $('rootDrop').addEventListener('drop', async e => { e.preventDefault(); $('rootDrop').classList.remove('over'); if (state.dragged) await move(state.dragged, null); });
+  document.addEventListener('click', async e => { const b=e.target.closest('button'); if(!b) return; const id=b.dataset.id; try { if(b.classList.contains('rename')) { const name=prompt('New category name:'); if(name) { await api({action:'rename-category', id, name}); await load(); } } if(b.classList.contains('delete') && confirm('Delete this category?')) { await api({action:'delete-category', id}); await load(); } } catch(err) { alert(err.message); } });
+  document.addEventListener('change', async e => { if(e.target.classList.contains('assign')) { try { await api({action:'assign-record', recordId:e.target.dataset.id, categoryId:e.target.value || null}); await load(); } catch(err) { alert(err.message); } } });
+  load();
+</script>
+</body></html>
