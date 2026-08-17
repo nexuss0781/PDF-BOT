@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { classifyRemotePdf } from './remote-pdf.js';
-import { createCategory, listCategories, listRecords as listParadoxRecords, moveCategory, savePending as saveParadoxPending, type Category as StoredCategory } from './store.js';
+import { createCategory, getChatActiveCategory, listCategories, listRecords as listParadoxRecords, moveCategory, savePending as saveParadoxPending, setChatActiveCategory, type Category as StoredCategory } from './store.js';
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
@@ -83,6 +83,17 @@ const categoryKeyboard = homeKeyboard();
 
 type PendingCategoryAction = { kind: 'create'; parentId: string | null; expiresAt: number };
 const pendingCategoryActions = new Map<number, PendingCategoryAction>();
+const activeCategoryMemory = new Map<number, string | null>();
+
+async function setActiveCategory(chatId: number, categoryId: string | null): Promise<void> {
+  activeCategoryMemory.set(chatId, categoryId);
+  if (PARADOX_ENABLED) await setChatActiveCategory(chatId, categoryId);
+}
+
+async function getActiveCategory(chatId: number): Promise<string | null> {
+  if (PARADOX_ENABLED) return getChatActiveCategory(chatId);
+  return activeCategoryMemory.get(chatId) || null;
+}
 
 async function telegram<T>(method: string, body: Record<string, unknown>): Promise<T> {
   const response = await fetch(`${TELEGRAM_API_URL}/${method}`, {
@@ -204,6 +215,7 @@ async function writeGithubLog(entries: RecordEntry[], sha?: string): Promise<voi
 }
 
 async function sendHome(chatId: number, editMessageId?: number): Promise<void> {
+  await setActiveCategory(chatId, null);
   const text = '<b>PDF Library</b>\n\nChoose an action below, or send me a PDF to classify and archive it.';
   if (editMessageId) {
     await telegram('editMessageText', { chat_id: chatId, message_id: editMessageId, text, parse_mode: 'HTML', reply_markup: homeKeyboard() });
@@ -248,6 +260,7 @@ async function sendTypeList(chatId: number, type: 'Scanned' | 'Selectable' | 'al
 }
 
 async function sendCategoryBrowser(chatId: number, parentId: string | null, editMessageId?: number): Promise<void> {
+  await setActiveCategory(chatId, parentId);
   if (!PARADOX_ENABLED) {
     const text = 'Nested categories require Paradox-DB to be enabled.';
     if (editMessageId) await telegram('editMessageText', { chat_id: chatId, message_id: editMessageId, text, reply_markup: homeKeyboard() });
@@ -310,6 +323,7 @@ async function handlePendingCategoryText(message: TelegramMessage): Promise<bool
 }
 
 async function sendCategoryRecords(chatId: number, categoryId: string | null, page: number, editMessageId?: number): Promise<void> {
+  await setActiveCategory(chatId, categoryId);
   const categories = PARADOX_ENABLED ? await listCategories() : [];
   const category = categoryId ? categories.find((item) => item.id === categoryId) : undefined;
   const { entries } = await readGithubLog();
@@ -354,6 +368,7 @@ type WorkerContext = {
   progressMessageId: number;
   sourceMessageId: number;
   senderId: number;
+  categoryId: string | null;
   title: string;
   sender: string;
   recordId: string;
@@ -391,7 +406,7 @@ async function finishDocument(context: WorkerContext, result: ClassificationResu
   };
   try {
     if (PARADOX_ENABLED) {
-      await saveParadoxPending({ id: context.recordId, title: context.title, sender: context.sender, sender_id: context.senderId, classification: result.type, source_url: sourceUrl, received_at: entry.receivedAt, strategy: result.strategy, bytes_read: result.bytesRead, pages_sampled: result.pagesSampled, metadata_message_id: copied.message_id });
+      await saveParadoxPending({ id: context.recordId, title: context.title, sender: context.sender, sender_id: context.senderId, classification: result.type, source_url: sourceUrl, received_at: entry.receivedAt, strategy: result.strategy, bytes_read: result.bytesRead, pages_sampled: result.pagesSampled, metadata_message_id: copied.message_id, category_id: context.categoryId });
     } else {
       const log = await readGithubLog();
       await writeGithubLog([...log.entries, entry], log.sha);
@@ -404,7 +419,8 @@ async function finishDocument(context: WorkerContext, result: ClassificationResu
 async function processDocument(message: TelegramMessage): Promise<void> {
   const document = message.document!;
   const title = document.file_name || 'Untitled PDF';
-  const context: WorkerContext = { chatId: message.chat.id, progressMessageId: 0, sourceMessageId: message.message_id, senderId: message.from?.id || 0, title, sender: senderName(message.from), recordId: `${Date.now()}-${message.message_id}` };
+  const activeCategoryId = await getActiveCategory(message.chat.id);
+  const context: WorkerContext = { chatId: message.chat.id, progressMessageId: 0, sourceMessageId: message.message_id, senderId: message.from?.id || 0, categoryId: activeCategoryId, title, sender: senderName(message.from), recordId: `${Date.now()}-${message.message_id}` };
   const progress = await telegram<TelegramResponseMessage>('sendMessage', { chat_id: message.chat.id, text: `<b>${escapeHtml(truncate(title, 180))}</b>\n\nPDF received. I am checking whether it is selectable or scanned…`, parse_mode: 'HTML', reply_markup: categoryKeyboard });
   context.progressMessageId = progress.message_id;
 
