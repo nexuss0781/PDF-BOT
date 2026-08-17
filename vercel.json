@@ -1,7 +1,10 @@
 {
   "functions": {
     "api/webhook.ts": {
-      "maxDuration": 60
+      "maxDuration": 60,
+      "includeFiles": [
+        "node_modules/sql.js/dist/sql-wasm.wasm"
+      ]
     }
   }
 }
