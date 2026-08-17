@@ -5,6 +5,7 @@ let dbPromise: Promise<ParadConnection> | undefined;
 async function openDb(): Promise<ParadConnection> {
   const db = await connect({
     name: process.env.PARADOX_DATABASE || 'pdf-records',
+    dbPath: process.env.PARADOX_DB_PATH || '/tmp/pdf-records.paradox',
     project: process.env.PARADOX_PROJECT || 'telegram-pdf-bot',
     gatewayUrl: process.env.PARADOX_GATEWAY_URL || 'https://paradoxdb.onrender.com/v1',
     apiKey: process.env.PARADOX_API_KEY,
