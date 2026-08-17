@@ -44,10 +44,31 @@ The external Local Bot API panel is required for arbitrary files above the norma
 | `GITHUB_REPO` | Optional fallback repository. |
 | `GITHUB_BRANCH` | Optional fallback branch; defaults to `main`. |
 | `GITHUB_LOG_PATH` | Optional fallback path; defaults to `data/pdf-dashboard.md`. |
+| `PDFBOT_WORKER_URL` | Public URL of the isolated Render PDF-BOT service, without a trailing slash. |
+| `PDFBOT_WORKER_SECRET` | Shared secret for Vercel-to-worker requests. |
+| `PDFBOT_CALLBACK_URL` | Public Vercel URL ending in `/api/worker-callback`. |
+| `PDFBOT_CALLBACK_SECRET` | Shared secret for worker-to-Vercel callbacks. |
 
-### External Render Bot API panel
+### Isolated Render PDF-BOT service
 
-No worker environment variables are required on Render for this project. The Render service is only used as an external Telegram Bot API endpoint. Configure the following variables in Vercel:
+Create a new Render web service from `nexuss0781/telegram-bot-api-pdf-bot` and do not modify the existing shared Bot API service. Use the Dockerfile in the repository and set the following service variables:
+
+| Variable | Value |
+|---|---|
+| `PDFBOT_WORKER_ENABLED` | `true` |
+| `TELEGRAM_API_ID` | The Telegram API ID used by the Local Bot API server. |
+| `TELEGRAM_API_HASH` | The Telegram API hash used by the Local Bot API server. |
+| `TELEGRAM_LOCAL` | `true` |
+| `TELEGRAM_WORK_DIR` | `/var/lib/telegram-bot-api` |
+| `TELEGRAM_TEMP_DIR` | `/tmp/telegram-bot-api` |
+| `PDFBOT_WORKER_SECRET` | A long random secret matching Vercel. |
+| `PORT` | Injected by Render; do not hard-code it. |
+
+The service exposes the Bot API through the public Render URL and the worker endpoint at `/pdfbot/classify`. The worker uses the local file path returned by `getFile`, samples the first three pages with `pdfinfo` and `pdftotext`, and reports `locating`, `structure`, `sampling`, `classified`, or `failed` stages to Vercel. It does not download a second copy of the PDF.
+
+### Existing external Render Bot API panel
+
+The existing shared panel remains untouched and may continue serving other projects. Its values are still used as the fallback configuration:
 
 | Variable | Value |
 |---|---|
