@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { classifyRemotePdf } from './remote-pdf.js';
-import { clearAllData, clearContentData, createCategory, exportBackup, getChatActiveCategory, listCategories, listRecords as listParadoxRecords, moveCategory, restoreBackup, savePending as saveParadoxPending, setChatActiveCategory, type Category as StoredCategory } from './store.js';
+import { clearAllData, clearContentData, createCategory, deleteCategory, exportBackup, getChatActiveCategory, listCategories, listRecords as listParadoxRecords, moveCategory, renameCategory, restoreBackup, savePending as saveParadoxPending, setChatActiveCategory, type Category as StoredCategory } from './store.js';
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
@@ -86,7 +86,7 @@ function homeKeyboard() {
 
 const categoryKeyboard = homeKeyboard();
 
-type PendingCategoryAction = { kind: 'create'; parentId: string | null; expiresAt: number };
+type PendingCategoryAction = { kind: 'create'; parentId: string | null; expiresAt: number } | { kind: 'rename'; categoryId: string; expiresAt: number };
 const pendingCategoryActions = new Map<number, PendingCategoryAction>();
 const pendingRestoreChats = new Set<number>();
 const activeCategoryMemory = new Map<number, string | null>();
@@ -341,10 +341,39 @@ async function sendCategoryBrowser(chatId: number, parentId: string | null, edit
   }
   if (inFolder.length) rows.push([{ text: `📄 PDFs in this folder (${inFolder.length})`, callback_data: `catpage:${parentId || 'root'}:0` }]);
   rows.push([{ text: '➕ Create category here', callback_data: `catcreate:${parentId || 'root'}` }, { text: '↔ Move category here', callback_data: `catmove:${parentId || 'root'}` }]);
+  if (current) rows.push([{ text: '↳ Nest this category', callback_data: `catnest:${current.id}` }, { text: '✎ Rename', callback_data: `catrename:${current.id}` }, { text: '🗑 Delete', callback_data: `catdelete:${current.id}` }]);
   if (parentId) rows.push([{ text: `↩ ${BOT_UI.labels.back}`, callback_data: current?.parent_id ? `cat:${current.parent_id}` : 'menu:browse' }, { text: `⌂ ${BOT_UI.labels.home}`, callback_data: 'menu:home' }]);
   else rows.push([{ text: `⌂ ${BOT_UI.labels.home}`, callback_data: 'menu:home' }]);
   const title = current ? `📂 ${current.name}` : `📂 ${BOT_UI.labels.root}`;
   const text = `<b>${escapeHtml(title)}</b>\n\n${children.length ? 'Choose a subcategory:' : 'No subcategories here yet.'}${inFolder.length ? `\nThis folder contains ${inFolder.length} PDF(s).` : ''}`;
+  const payload = { chat_id: chatId, text, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
+  if (editMessageId) await telegram('editMessageText', { ...payload, message_id: editMessageId });
+  else await telegram('sendMessage', payload);
+}
+
+async function sendNestCategoryMenu(chatId: number, sourceId: string, editMessageId?: number): Promise<void> {
+  if (!PARADOX_ENABLED) return sendCategoryBrowser(chatId, null, editMessageId);
+  const categories = await listCategories();
+  const source = categories.find((category) => category.id === sourceId);
+  if (!source) return sendCategoryBrowser(chatId, null, editMessageId);
+  const descendantIds = new Set<string>();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const category of categories) {
+      if (category.parent_id === sourceId || (category.parent_id && descendantIds.has(category.parent_id))) {
+        if (!descendantIds.has(category.id)) { descendantIds.add(category.id); changed = true; }
+      }
+    }
+  }
+  const candidates = categories.filter((category) => category.id !== sourceId && !descendantIds.has(category.id));
+  const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+  rows.push([{ text: '📁 Root', callback_data: `nesttarget:${sourceId}:root` }]);
+  for (let index = 0; index < candidates.length; index += 2) {
+    rows.push(candidates.slice(index, index + 2).map((category) => ({ text: `📁 ${truncate(category.name, 26)}`, callback_data: `nesttarget:${sourceId}:${category.id}` })));
+  }
+  rows.push([{ text: 'Cancel', callback_data: `cat:${sourceId}` }]);
+  const text = `<b>Nest ${escapeHtml(source.name)}</b>\n\nChoose the category that should contain it. Invalid descendant destinations are hidden.`;
   const payload = { chat_id: chatId, text, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
   if (editMessageId) await telegram('editMessageText', { ...payload, message_id: editMessageId });
   else await telegram('sendMessage', payload);
@@ -372,15 +401,23 @@ async function handlePendingCategoryText(message: TelegramMessage): Promise<bool
   if (!pending) return false;
   pendingCategoryActions.delete(message.chat.id);
   if (pending.expiresAt < Date.now() || message.text.trim() === '/cancel') {
-    await telegram('sendMessage', { chat_id: message.chat.id, text: 'Category creation cancelled.', reply_markup: homeKeyboard() });
+    await telegram('sendMessage', { chat_id: message.chat.id, text: 'Category operation cancelled.', reply_markup: homeKeyboard() });
     return true;
   }
   try {
-    const category = await createCategory(message.text.trim().slice(0, 80), pending.parentId);
-    await telegram('sendMessage', { chat_id: message.chat.id, text: `Created category <b>${escapeHtml(category.name)}</b>.`, parse_mode: 'HTML' });
-    await sendCategoryBrowser(message.chat.id, pending.parentId);
+    if (pending.kind === 'rename') {
+      await renameCategory(pending.categoryId, message.text.trim().slice(0, 80));
+      await telegram('sendMessage', { chat_id: message.chat.id, text: 'Category renamed successfully.' });
+      const categories = await listCategories();
+      const category = categories.find((item) => item.id === pending.categoryId);
+      await sendCategoryBrowser(message.chat.id, category?.parent_id || null);
+    } else {
+      const category = await createCategory(message.text.trim().slice(0, 80), pending.parentId);
+      await telegram('sendMessage', { chat_id: message.chat.id, text: `Created category <b>${escapeHtml(category.name)}</b>.`, parse_mode: 'HTML' });
+      await sendCategoryBrowser(message.chat.id, pending.parentId);
+    }
   } catch (error) {
-    await telegram('sendMessage', { chat_id: message.chat.id, text: `Could not create category: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: homeKeyboard() });
+    await telegram('sendMessage', { chat_id: message.chat.id, text: `Category operation failed: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: homeKeyboard() });
   }
   return true;
 }
@@ -618,7 +655,40 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       } else if (data === 'settings:clear:no') {
         await sendSettings(chatId, query.message?.message_id);
       } else if (data === 'menu:browse') await sendCategoryBrowser(chatId, null, query.message?.message_id);
-      else if (data.startsWith('catcreate:')) {
+      else if (data.startsWith('catnest:')) {
+        await sendNestCategoryMenu(chatId, data.slice(8), query.message?.message_id);
+      } else if (data.startsWith('nesttarget:')) {
+        const [, sourceId, targetText] = data.split(':');
+        try {
+          await moveCategory(sourceId, targetText === 'root' ? null : targetText);
+          await telegram('sendMessage', { chat_id: chatId, text: 'Category nested successfully.' });
+          await sendCategoryBrowser(chatId, targetText === 'root' ? null : targetText);
+        } catch (error) {
+          await telegram('sendMessage', { chat_id: chatId, text: `Could not nest category: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: homeKeyboard() });
+        }
+      } else if (data.startsWith('catrename:')) {
+        const categoryId = data.slice(10);
+        pendingCategoryActions.set(chatId, { kind: 'rename', categoryId, expiresAt: Date.now() + 5 * 60 * 1000 });
+        await telegram('sendMessage', { chat_id: chatId, text: 'Type the new category name. Send /cancel to stop.', reply_markup: { force_reply: true, input_field_placeholder: 'New category name' } });
+      } else if (data.startsWith('catdelete:yes:')) {
+        const categoryId = data.slice(14);
+        try {
+          const categories = await listCategories();
+          const category = categories.find((item) => item.id === categoryId);
+          await deleteCategory(categoryId);
+          await setActiveCategory(chatId, category?.parent_id || null);
+          await telegram('editMessageText', { chat_id: chatId, message_id: query.message?.message_id, text: `Deleted category <b>${escapeHtml(category?.name || 'category')}</b>. Its subcategories were moved to the former parent and its PDFs were unassigned.`, parse_mode: 'HTML', reply_markup: homeKeyboard() });
+        } catch (error) {
+          await telegram('sendMessage', { chat_id: chatId, text: `Could not delete category: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: homeKeyboard() });
+        }
+      } else if (data.startsWith('catdelete:no:')) {
+        await sendCategoryBrowser(chatId, data.slice(13), query.message?.message_id);
+      } else if (data.startsWith('catdelete:')) {
+        const categoryId = data.slice(10);
+        const categories = await listCategories();
+        const category = categories.find((item) => item.id === categoryId);
+        await telegram('editMessageText', { chat_id: chatId, message_id: query.message?.message_id, text: `<b>Delete ${escapeHtml(category?.name || 'this category')}?</b>\n\nIts subcategories will move to the former parent and its PDFs will become unassigned.`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Yes, delete', callback_data: `catdelete:yes:${categoryId}` }, { text: 'Cancel', callback_data: `catdelete:no:${categoryId}` }]] } });
+      } else if (data.startsWith('catcreate:')) {
         if (!PARADOX_ENABLED) await telegram('sendMessage', { chat_id: chatId, text: 'Category management requires Paradox-DB to be enabled.', reply_markup: homeKeyboard() });
         else {
           const parentText = data.slice(10);
