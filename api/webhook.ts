@@ -115,9 +115,9 @@ async function telegram<T>(method: string, body: Record<string, unknown>): Promi
 
 function settingsKeyboard() {
   return { inline_keyboard: [
-    [{ text: '⬇ Back up data', callback_data: 'settings:backup' }],
-    [{ text: '⬆ Restore data', callback_data: 'settings:restore' }],
-    [{ text: '🗑 Clear all data', callback_data: 'settings:clear' }],
+    [{ text: '💾 Back up saved file', callback_data: 'settings:backup' }],
+    [{ text: '📤 Restore from file', callback_data: 'settings:restore' }],
+    [{ text: '🗑 Clear data', callback_data: 'settings:clear' }],
     [{ text: '↩ Home', callback_data: 'menu:home' }],
   ] };
 }
