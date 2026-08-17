@@ -13,7 +13,6 @@ const GITHUB_REPO = process.env.GITHUB_REPO;
 const GITHUB_LOG_PATH = process.env.GITHUB_LOG_PATH || 'data/pdf-dashboard.md';
 const TELEGRAM_API_URL = `${TELEGRAM_API_BASE}${BOT_TOKEN || ''}`;
 const TELEGRAM_FILE_BASE_URL = (process.env.TELEGRAM_FILE_BASE_URL || `${TELEGRAM_API_BASE.replace(/\/bot$/, '')}/file`).replace(/\/$/, '');
-const ADMIN_USER_IDS = new Set((process.env.TELEGRAM_ADMIN_USER_IDS || '').split(',').map((value) => Number(value.trim())).filter((value) => Number.isFinite(value) && value > 0));
 const PDFBOT_WORKER_URL = process.env.PDFBOT_WORKER_URL?.replace(/\/$/, '');
 const PDFBOT_WORKER_SECRET = process.env.PDFBOT_WORKER_SECRET;
 const PDFBOT_CALLBACK_URL = process.env.PDFBOT_CALLBACK_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}/api/worker-callback` : undefined);
@@ -129,10 +128,6 @@ function clearConfirmationKeyboard() {
   ]] };
 }
 
-function isAdmin(userId?: number): boolean {
-  return Boolean(userId && ADMIN_USER_IDS.has(userId));
-}
-
 async function sendTelegramBackup(chatId: number): Promise<void> {
   if (!PARADOX_ENABLED) throw new Error('Paradox-DB is not configured');
   const backup = await exportBackup();
@@ -159,11 +154,9 @@ async function restoreTelegramBackup(chatId: number, document: TelegramDocument)
   await setActiveCategory(chatId, null);
 }
 
-async function sendSettings(chatId: number, userId?: number, editMessageId?: number): Promise<void> {
-  const text = isAdmin(userId)
-    ? '<b>Settings</b>\n\nBackups are point-in-time snapshots of PDF metadata and category structure. Restore replaces the current metadata and categories. Clear permanently deletes them after confirmation.'
-    : '<b>Settings</b>\n\nSettings are restricted to the configured administrator account.';
-  const payload = { chat_id: chatId, text, parse_mode: 'HTML', reply_markup: isAdmin(userId) ? settingsKeyboard() : { inline_keyboard: [[{ text: '↩ Home', callback_data: 'menu:home' }]] } };
+async function sendSettings(chatId: number, editMessageId?: number): Promise<void> {
+  const text = '<b>Settings</b>\n\nBackups are point-in-time snapshots of PDF metadata and category structure. Restore replaces the current metadata and categories. Clear permanently deletes them after confirmation.';
+  const payload = { chat_id: chatId, text, parse_mode: 'HTML', reply_markup: settingsKeyboard() };
   if (editMessageId) await telegram('editMessageText', { ...payload, message_id: editMessageId });
   else await telegram('sendMessage', payload);
 }
@@ -598,28 +591,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (!chatId) return res.status(200).json({ ok: true });
       if (data === 'menu:home') await sendHome(chatId, query.message?.message_id);
       else if (data === 'menu:help') await sendHelp(chatId, query.message?.message_id);
-      else if (data === 'menu:settings') await sendSettings(chatId, query.from.id, query.message?.message_id);
+      else if (data === 'menu:settings') await sendSettings(chatId, query.message?.message_id);
       else if (data === 'settings:backup') {
-        if (!isAdmin(query.from.id)) await sendSettings(chatId, query.from.id, query.message?.message_id);
-        else {
-          try { await sendTelegramBackup(chatId); } catch (error) { await telegram('sendMessage', { chat_id: chatId, text: `Backup failed: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: settingsKeyboard() }); }
-        }
+        try { await sendTelegramBackup(chatId); } catch (error) { await telegram('sendMessage', { chat_id: chatId, text: `Backup failed: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: settingsKeyboard() }); }
       } else if (data === 'settings:restore') {
-        if (!isAdmin(query.from.id)) await sendSettings(chatId, query.from.id, query.message?.message_id);
-        else {
-          pendingRestoreChats.add(chatId);
-          await telegram('sendMessage', { chat_id: chatId, text: 'Send the JSON backup file produced by this bot. Restore replaces the current PDF metadata and category structure. Send /cancel to stop.', reply_markup: { force_reply: true, input_field_placeholder: 'Upload backup JSON' } });
-        }
+        pendingRestoreChats.add(chatId);
+        await telegram('sendMessage', { chat_id: chatId, text: 'Send the JSON backup file produced by this bot. Restore replaces the current PDF metadata and category structure. Send /cancel to stop.', reply_markup: { force_reply: true, input_field_placeholder: 'Upload backup JSON' } });
       } else if (data === 'settings:clear') {
-        if (isAdmin(query.from.id)) await telegram('editMessageText', { chat_id: chatId, message_id: query.message?.message_id, text: '<b>Clear all data?</b>\n\nThis permanently removes every PDF record, category, and active upload destination. This cannot be undone unless you have a backup.', parse_mode: 'HTML', reply_markup: clearConfirmationKeyboard() });
-        else await sendSettings(chatId, query.from.id, query.message?.message_id);
+        await telegram('editMessageText', { chat_id: chatId, message_id: query.message?.message_id, text: '<b>Clear all data?</b>\n\nThis permanently removes every PDF record, category, and active upload destination. This cannot be undone unless you have a backup.', parse_mode: 'HTML', reply_markup: clearConfirmationKeyboard() });
       } else if (data === 'settings:clear:yes') {
-        if (!isAdmin(query.from.id)) await sendSettings(chatId, query.from.id, query.message?.message_id);
-        else {
-          try { await clearAllData(); activeCategoryMemory.clear(); await telegram('editMessageText', { chat_id: chatId, message_id: query.message?.message_id, text: 'All PDF records, categories, and active destinations have been cleared.', reply_markup: homeKeyboard() }); } catch (error) { await telegram('sendMessage', { chat_id: chatId, text: `Clear failed: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: settingsKeyboard() }); }
-        }
+        try { await clearAllData(); activeCategoryMemory.clear(); await telegram('editMessageText', { chat_id: chatId, message_id: query.message?.message_id, text: 'All PDF records, categories, and active destinations have been cleared.', reply_markup: homeKeyboard() }); } catch (error) { await telegram('sendMessage', { chat_id: chatId, text: `Clear failed: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: settingsKeyboard() }); }
       } else if (data === 'settings:clear:no') {
-        await sendSettings(chatId, query.from.id, query.message?.message_id);
+        await sendSettings(chatId, query.message?.message_id);
       } else if (data === 'menu:browse') await sendCategoryBrowser(chatId, null, query.message?.message_id);
       else if (data.startsWith('catcreate:')) {
         if (!PARADOX_ENABLED) await telegram('sendMessage', { chat_id: chatId, text: 'Category management requires Paradox-DB to be enabled.', reply_markup: homeKeyboard() });
@@ -657,13 +640,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       pendingRestoreChats.delete(update.message.chat.id);
       await telegram('sendMessage', { chat_id: update.message.chat.id, text: 'Restore cancelled.', reply_markup: settingsKeyboard() });
     } else if (update.message?.document && pendingRestoreChats.has(update.message.chat.id)) {
-      if (!isAdmin(update.message.from?.id)) {
-        pendingRestoreChats.delete(update.message.chat.id);
-        await telegram('sendMessage', { chat_id: update.message.chat.id, text: 'Restore is restricted to the configured administrator.', reply_markup: homeKeyboard() });
-      } else {
-        pendingRestoreChats.delete(update.message.chat.id);
-        try { await restoreTelegramBackup(update.message.chat.id, update.message.document); await telegram('sendMessage', { chat_id: update.message.chat.id, text: 'Backup restored successfully. The current PDF metadata and category structure now match the uploaded snapshot.', reply_markup: homeKeyboard() }); } catch (error) { await telegram('sendMessage', { chat_id: update.message.chat.id, text: `Restore failed: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: settingsKeyboard() }); }
-      }
+      pendingRestoreChats.delete(update.message.chat.id);
+      try { await restoreTelegramBackup(update.message.chat.id, update.message.document); await telegram('sendMessage', { chat_id: update.message.chat.id, text: 'Backup restored successfully. The current PDF metadata and category structure now match the uploaded snapshot.', reply_markup: homeKeyboard() }); } catch (error) { await telegram('sendMessage', { chat_id: update.message.chat.id, text: `Restore failed: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: settingsKeyboard() }); }
     } else if (update.message?.text && await handlePendingCategoryText(update.message)) {
       // Category creation reply was handled above.
     } else if (update.message?.document) {
@@ -677,7 +655,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     } else if (update.message?.text === '/categories' || update.message?.text === '/browse') {
       await sendCategoryBrowser(update.message.chat.id, null);
     } else if (update.message?.text === '/settings') {
-      await sendSettings(update.message.chat.id, update.message.from?.id);
+      await sendSettings(update.message.chat.id);
     } else if (update.message?.text === '/menu' || update.message?.text === '/start') {
       await sendHome(update.message.chat.id);
     } else if (update.message?.text === '/help') {
