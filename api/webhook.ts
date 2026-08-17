@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { classifyRemotePdf } from './remote-pdf.js';
-import { clearAllData, createCategory, exportBackup, getChatActiveCategory, listCategories, listRecords as listParadoxRecords, moveCategory, restoreBackup, savePending as saveParadoxPending, setChatActiveCategory, type Category as StoredCategory } from './store.js';
+import { clearAllData, clearContentData, createCategory, exportBackup, getChatActiveCategory, listCategories, listRecords as listParadoxRecords, moveCategory, restoreBackup, savePending as saveParadoxPending, setChatActiveCategory, type Category as StoredCategory } from './store.js';
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
@@ -121,9 +121,17 @@ function settingsKeyboard() {
   ] };
 }
 
-function clearConfirmationKeyboard() {
+function clearDataKeyboard() {
+  return { inline_keyboard: [
+    [{ text: '🧹 Clear content', callback_data: 'settings:clear:content' }],
+    [{ text: '⚠ Clear all data', callback_data: 'settings:clear:all' }],
+    [{ text: '↩ Back to Settings', callback_data: 'menu:settings' }],
+  ] };
+}
+
+function clearConfirmationKeyboard(kind: 'content' | 'all') {
   return { inline_keyboard: [[
-    { text: 'Yes, clear everything', callback_data: 'settings:clear:yes' },
+    { text: kind === 'content' ? 'Yes, clear content' : 'Yes, clear all data', callback_data: `settings:clear:${kind}:yes` },
     { text: 'Cancel', callback_data: 'settings:clear:no' },
   ]] };
 }
@@ -598,9 +606,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         pendingRestoreChats.add(chatId);
         await telegram('sendMessage', { chat_id: chatId, text: 'Send the JSON backup file produced by this bot. Restore replaces the current PDF metadata and category structure. Send /cancel to stop.', reply_markup: { force_reply: true, input_field_placeholder: 'Upload backup JSON' } });
       } else if (data === 'settings:clear') {
-        await telegram('editMessageText', { chat_id: chatId, message_id: query.message?.message_id, text: '<b>Clear all data?</b>\n\nThis permanently removes every PDF record, category, and active upload destination. This cannot be undone unless you have a backup.', parse_mode: 'HTML', reply_markup: clearConfirmationKeyboard() });
-      } else if (data === 'settings:clear:yes') {
-        try { await clearAllData(); activeCategoryMemory.clear(); await telegram('editMessageText', { chat_id: chatId, message_id: query.message?.message_id, text: 'All PDF records, categories, and active destinations have been cleared.', reply_markup: homeKeyboard() }); } catch (error) { await telegram('sendMessage', { chat_id: chatId, text: `Clear failed: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: settingsKeyboard() }); }
+        await telegram('editMessageText', { chat_id: chatId, message_id: query.message?.message_id, text: '<b>Choose what to clear</b>\n\n<b>Clear content</b> deletes saved PDF records but keeps all categories and subcategories.\n\n<b>Clear all data</b> deletes PDF records and the complete category structure.', parse_mode: 'HTML', reply_markup: clearDataKeyboard() });
+      } else if (data === 'settings:clear:content') {
+        await telegram('editMessageText', { chat_id: chatId, message_id: query.message?.message_id, text: '<b>Clear content?</b>\n\nThis deletes all saved PDF records and clears their assignments, but preserves every category and subcategory.', parse_mode: 'HTML', reply_markup: clearConfirmationKeyboard('content') });
+      } else if (data === 'settings:clear:all') {
+        await telegram('editMessageText', { chat_id: chatId, message_id: query.message?.message_id, text: '<b>Clear all data?</b>\n\nThis permanently removes every PDF record, category, subcategory, and active upload destination. This cannot be undone unless you have a backup.', parse_mode: 'HTML', reply_markup: clearConfirmationKeyboard('all') });
+      } else if (data === 'settings:clear:content:yes') {
+        try { await clearContentData(); activeCategoryMemory.clear(); await telegram('editMessageText', { chat_id: chatId, message_id: query.message?.message_id, text: 'All saved PDF content has been cleared. Your category and subcategory structure was preserved.', reply_markup: homeKeyboard() }); } catch (error) { await telegram('sendMessage', { chat_id: chatId, text: `Clear content failed: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: settingsKeyboard() }); }
+      } else if (data === 'settings:clear:all:yes') {
+        try { await clearAllData(); activeCategoryMemory.clear(); await telegram('editMessageText', { chat_id: chatId, message_id: query.message?.message_id, text: 'All PDF records, categories, subcategories, and active destinations have been cleared.', reply_markup: homeKeyboard() }); } catch (error) { await telegram('sendMessage', { chat_id: chatId, text: `Clear all failed: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: settingsKeyboard() }); }
       } else if (data === 'settings:clear:no') {
         await sendSettings(chatId, query.message?.message_id);
       } else if (data === 'menu:browse') await sendCategoryBrowser(chatId, null, query.message?.message_id);

@@ -221,6 +221,12 @@ function validateBackup(value: unknown): BackupPackage {
   return candidate as BackupPackage;
 }
 
+export async function clearContentData(): Promise<void> {
+  const db = await getDb();
+  db.execute('DELETE FROM pdf_records');
+  db.execute('UPDATE chat_category_context SET category_id = NULL, updated_at = ?', [new Date().toISOString()]);
+}
+
 export async function clearAllData(): Promise<void> {
   const db = await getDb();
   db.execute('DELETE FROM pdf_records');
