@@ -10,6 +10,11 @@ const TELEGRAM_API_BASE = (process.env.TELEGRAM_API_BASE || 'https://api.telegra
 const PARADOX_ENABLED = Boolean(process.env.PARADOX_API_KEY && process.env.PARADOX_PASSPHRASE);
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_REPO = process.env.GITHUB_REPO;
+const GITHUB_ACTIONS_TOKEN = process.env.GITHUB_ACTIONS_TOKEN;
+const GITHUB_ACTIONS_REPO = process.env.GITHUB_ACTIONS_REPO || 'nexuss0781/My-Computer';
+const GITHUB_ACTIONS_WORKFLOW = process.env.GITHUB_ACTIONS_WORKFLOW || 'sync-telegram.yml';
+const GITHUB_ACTIONS_REF = process.env.GITHUB_ACTIONS_REF || 'main';
+const MY_COMPUTER_SYNC_SECRET = process.env.MY_COMPUTER_SYNC_SECRET;
 const GITHUB_LOG_PATH = process.env.GITHUB_LOG_PATH || 'data/pdf-dashboard.md';
 const TELEGRAM_API_URL = `${TELEGRAM_API_BASE}${BOT_TOKEN || ''}`;
 const TELEGRAM_FILE_BASE_URL = (process.env.TELEGRAM_FILE_BASE_URL || `${TELEGRAM_API_BASE.replace(/\/bot$/, '')}/file`).replace(/\/$/, '');
@@ -78,6 +83,7 @@ const BOT_UI = {
 function homeKeyboard() {
   return { inline_keyboard: [
     [{ text: `📂 ${BOT_UI.labels.browse}`, callback_data: 'menu:browse' }],
+    [{ text: '🔄 Synchronize to Hugging Face', callback_data: 'sync:start' }],
     [{ text: `📗 ${BOT_UI.labels.selectable}`, callback_data: 'type:Selectable:0' }, { text: `🖼 ${BOT_UI.labels.scanned}`, callback_data: 'type:Scanned:0' }],
     [{ text: `📚 ${BOT_UI.labels.all}`, callback_data: 'type:all:0' }, { text: `⚙ Settings`, callback_data: 'menu:settings' }],
     [{ text: `❔ ${BOT_UI.labels.help}`, callback_data: 'menu:help' }],
@@ -287,8 +293,27 @@ async function sendHome(chatId: number, editMessageId?: number): Promise<void> {
   }
 }
 
+async function startMyComputerSync(chatId: number): Promise<void> {
+  if (!GITHUB_ACTIONS_TOKEN || !MY_COMPUTER_SYNC_SECRET) throw new Error('My-Computer GitHub dispatch is not configured');
+  const status = await telegram<TelegramResponseMessage>('sendMessage', { chat_id: chatId, text: '🔄 Synchronization requested. Starting My-Computer batch workflow…', reply_markup: homeKeyboard() });
+  const response = await fetch(`https://api.github.com/repos/${GITHUB_ACTIONS_REPO}/actions/workflows/${encodeURIComponent(GITHUB_ACTIONS_WORKFLOW)}/dispatches`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${GITHUB_ACTIONS_TOKEN}`,
+      accept: 'application/vnd.github+json',
+      'content-type': 'application/json',
+      'user-agent': 'my-computer-telegram-sync',
+    },
+    body: JSON.stringify({
+      ref: GITHUB_ACTIONS_REF,
+      inputs: { project_id: 'telegram-pdf-bot', chat_id: String(chatId), status_message_id: String(status.message_id) },
+    }),
+  });
+  if (!response.ok) throw new Error(`GitHub workflow dispatch failed: ${response.status} ${(await response.text()).slice(0, 240)}`);
+}
+
 async function sendHelp(chatId: number, editMessageId?: number): Promise<void> {
-  const text = '<b>How to use PDF Library</b>\n\n• Send a PDF to classify and forward it.\n• Browse categories to open nested folders.\n• Use Scanned, Selectable, or All PDFs to browse by type.\n• Use /menu to reopen this menu.\n• Use /categories to open the category tree.';
+  const text = '<b>How to use PDF Library</b>\n\n• Send a PDF to classify and forward it.\n• Browse categories to open nested folders.\n• Use Scanned, Selectable, or All PDFs to browse by type.\n• Press Synchronize to Hugging Face to run the My-Computer batch workflow.\n• Use /menu to reopen this menu.\n• Use /categories to open the category tree.';
   const markup = { inline_keyboard: [[{ text: `↩ ${BOT_UI.labels.home}`, callback_data: 'menu:home' }]] };
   if (editMessageId) await telegram('editMessageText', { chat_id: chatId, message_id: editMessageId, text, parse_mode: 'HTML', reply_markup: markup });
   else await telegram('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', reply_markup: markup });
@@ -464,6 +489,7 @@ async function updateUserResult(chatId: number, progressMessageId: number, title
 }
 
 type WorkerContext = {
+  fileId: string;
   chatId: number;
   progressMessageId: number;
   sourceMessageId: number;
@@ -529,7 +555,7 @@ async function processForwardJob({ context, result }: ForwardJob): Promise<void>
     strategy: result.strategy, bytesRead: result.bytesRead, pagesSampled: result.pagesSampled,
   };
   if (PARADOX_ENABLED) {
-    await saveParadoxPending({ id: context.recordId, title: context.title, sender: context.sender, sender_id: context.senderId, classification: result.type, source_url: sourceUrl, received_at: entry.receivedAt, strategy: result.strategy, bytes_read: result.bytesRead, pages_sampled: result.pagesSampled, metadata_message_id: copied.message_id, category_id: context.categoryId });
+    await saveParadoxPending({ id: context.recordId, title: context.title, sender: context.sender, sender_id: context.senderId, classification: result.type, source_url: sourceUrl, received_at: entry.receivedAt, strategy: result.strategy, bytes_read: result.bytesRead, pages_sampled: result.pagesSampled, metadata_message_id: copied.message_id, category_id: context.categoryId, source_file_id: context.fileId, source_chat_id: context.chatId, source_message_id: context.sourceMessageId, sync_status: 'pending' });
   } else {
     const log = await readGithubLog();
     await writeGithubLog([...log.entries, entry], log.sha);
@@ -572,7 +598,7 @@ async function processDocument(message: TelegramMessage): Promise<void> {
   const document = message.document!;
   const title = document.file_name || 'Untitled PDF';
   const activeCategoryId = await getActiveCategory(message.chat.id);
-  const context: WorkerContext = { chatId: message.chat.id, progressMessageId: 0, sourceMessageId: message.message_id, senderId: message.from?.id || 0, categoryId: activeCategoryId, title, sender: senderName(message.from), recordId: `${Date.now()}-${message.message_id}` };
+  const context: WorkerContext = { fileId: document.file_id, chatId: message.chat.id, progressMessageId: 0, sourceMessageId: message.message_id, senderId: message.from?.id || 0, categoryId: activeCategoryId, title, sender: senderName(message.from), recordId: `${Date.now()}-${message.message_id}` };
   const progress = await telegram<TelegramResponseMessage>('sendMessage', { chat_id: message.chat.id, text: `<b>${escapeHtml(truncate(title, 180))}</b>\n\nPDF received. I am checking whether it is selectable or scanned…`, parse_mode: 'HTML', reply_markup: categoryKeyboard });
   context.progressMessageId = progress.message_id;
 
@@ -635,6 +661,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       await telegram('answerCallbackQuery', { callback_query_id: query.id });
       if (!chatId) return res.status(200).json({ ok: true });
       if (data === 'menu:home') await sendHome(chatId, query.message?.message_id);
+      else if (data === 'sync:start') {
+        try { await startMyComputerSync(chatId); } catch (error) { await telegram('sendMessage', { chat_id: chatId, text: `Synchronization could not start: ${escapeHtml(error instanceof Error ? error.message : 'unknown error')}`, parse_mode: 'HTML', reply_markup: homeKeyboard() }); }
+      }
       else if (data === 'menu:help') await sendHelp(chatId, query.message?.message_id);
       else if (data === 'menu:settings') await sendSettings(chatId, query.message?.message_id);
       else if (data === 'settings:backup') {

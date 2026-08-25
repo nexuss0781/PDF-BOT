@@ -25,9 +25,23 @@ async function openDb(): Promise<ParadConnection> {
     bytes_read INTEGER DEFAULT 0,
     pages_sampled INTEGER DEFAULT 0,
     metadata_message_id INTEGER NOT NULL,
-    category_id TEXT
+    category_id TEXT,
+    source_file_id TEXT,
+    source_chat_id INTEGER,
+    source_message_id INTEGER,
+    sync_status TEXT NOT NULL DEFAULT 'pending',
+    hf_path TEXT,
+    hf_url TEXT,
+    sha256 TEXT,
+    sync_error TEXT,
+    sync_job_id TEXT
   )`);
-  try { db.execute('ALTER TABLE pdf_records ADD COLUMN category_id TEXT'); } catch { /* existing schema already has it */ }
+  for (const column of [
+    'category_id TEXT', 'source_file_id TEXT', 'source_chat_id INTEGER', 'source_message_id INTEGER',
+    "sync_status TEXT NOT NULL DEFAULT 'pending'", 'hf_path TEXT', 'hf_url TEXT', 'sha256 TEXT', 'sync_error TEXT', 'sync_job_id TEXT',
+  ]) {
+    try { db.execute(`ALTER TABLE pdf_records ADD COLUMN ${column}`); } catch { /* existing schema already has it */ }
+  }
   db.execute(`CREATE TABLE IF NOT EXISTS categories (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -62,6 +76,15 @@ export type PdfRecord = {
   pages_sampled?: number;
   metadata_message_id: number;
   category_id?: string | null;
+  source_file_id?: string | null;
+  source_chat_id?: number | null;
+  source_message_id?: number | null;
+  sync_status?: 'pending' | 'queued' | 'uploading' | 'synced' | 'retry_wait' | 'failed';
+  hf_path?: string | null;
+  hf_url?: string | null;
+  sha256?: string | null;
+  sync_error?: string | null;
+  sync_job_id?: string | null;
 };
 
 export type Category = {
@@ -83,13 +106,18 @@ export type BackupPackage = {
 
 export async function savePending(record: PdfRecord): Promise<void> {
   const db = await getDb();
-  db.execute(`INSERT INTO pdf_records (id, title, sender, sender_id, classification, source_url, received_at, strategy, bytes_read, pages_sampled, metadata_message_id, category_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  db.execute(`INSERT INTO pdf_records (id, title, sender, sender_id, classification, source_url, received_at, strategy, bytes_read, pages_sampled, metadata_message_id, category_id, source_file_id, source_chat_id, source_message_id, sync_status, hf_path, hf_url, sha256, sync_error, sync_job_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET title=excluded.title, sender=excluded.sender, sender_id=excluded.sender_id,
       classification=excluded.classification, source_url=excluded.source_url, received_at=excluded.received_at,
       strategy=excluded.strategy, bytes_read=excluded.bytes_read, pages_sampled=excluded.pages_sampled,
-      metadata_message_id=excluded.metadata_message_id, category_id=excluded.category_id`,
-    [record.id, record.title, record.sender, record.sender_id, record.classification, record.source_url, record.received_at, record.strategy || null, record.bytes_read || 0, record.pages_sampled || 0, record.metadata_message_id, record.category_id || null]);
+      metadata_message_id=excluded.metadata_message_id, category_id=excluded.category_id,
+      source_file_id=COALESCE(excluded.source_file_id, pdf_records.source_file_id),
+      source_chat_id=COALESCE(excluded.source_chat_id, pdf_records.source_chat_id),
+      source_message_id=COALESCE(excluded.source_message_id, pdf_records.source_message_id),
+      sync_status=COALESCE(excluded.sync_status, pdf_records.sync_status), hf_path=excluded.hf_path, hf_url=excluded.hf_url,
+      sha256=excluded.sha256, sync_error=excluded.sync_error, sync_job_id=excluded.sync_job_id`,
+    [record.id, record.title, record.sender, record.sender_id, record.classification, record.source_url, record.received_at, record.strategy || null, record.bytes_read || 0, record.pages_sampled || 0, record.metadata_message_id, record.category_id || null, record.source_file_id || null, record.source_chat_id || null, record.source_message_id || null, record.sync_status || 'pending', record.hf_path || null, record.hf_url || null, record.sha256 || null, record.sync_error || null, record.sync_job_id || null]);
 }
 
 export async function updateRecord(id: string, patch: Partial<PdfRecord>): Promise<void> {
@@ -99,6 +127,17 @@ export async function updateRecord(id: string, patch: Partial<PdfRecord>): Promi
   const db = await getDb();
   const values = fields.map((field) => (patch as any)[field] ?? null);
   db.execute(`UPDATE pdf_records SET ${fields.map((field) => `${field} = ?`).join(', ')} WHERE id = ?`, [...values, id]);
+}
+
+export async function listPendingSync(limit = 100): Promise<PdfRecord[]> {
+  const db = await getDb();
+  const safeLimit = Math.max(1, Math.min(500, Math.floor(limit)));
+  return db.execute(`SELECT * FROM pdf_records WHERE sync_status IN ('pending', 'retry_wait', 'failed') AND source_file_id IS NOT NULL ORDER BY received_at ASC LIMIT ${safeLimit}`).rows as PdfRecord[];
+}
+
+export async function updateSyncState(id: string, patch: Pick<PdfRecord, 'sync_status' | 'hf_path' | 'hf_url' | 'sha256' | 'sync_error' | 'sync_job_id'>): Promise<void> {
+  const db = await getDb();
+  db.execute(`UPDATE pdf_records SET sync_status = ?, hf_path = COALESCE(?, hf_path), hf_url = COALESCE(?, hf_url), sha256 = COALESCE(?, sha256), sync_error = COALESCE(?, sync_error), sync_job_id = COALESCE(?, sync_job_id) WHERE id = ?`, [patch.sync_status || 'pending', patch.hf_path ?? null, patch.hf_url ?? null, patch.sha256 ?? null, patch.sync_error ?? null, patch.sync_job_id ?? null, id]);
 }
 
 export async function listRecords(categoryId?: string | null): Promise<PdfRecord[]> {
@@ -246,7 +285,7 @@ export async function restoreBackup(value: unknown): Promise<void> {
       db.execute('INSERT INTO categories (id, name, parent_id, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)', [category.id, category.name, category.parent_id || null, category.sort_order || 0, category.created_at, category.updated_at]);
     }
     for (const record of backup.pdf_records) {
-      db.execute(`INSERT INTO pdf_records (id, title, sender, sender_id, classification, source_url, received_at, strategy, bytes_read, pages_sampled, metadata_message_id, category_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [record.id, record.title, record.sender, record.sender_id, record.classification, record.source_url, record.received_at, record.strategy || null, record.bytes_read || 0, record.pages_sampled || 0, record.metadata_message_id, record.category_id || null]);
+      db.execute(`INSERT INTO pdf_records (id, title, sender, sender_id, classification, source_url, received_at, strategy, bytes_read, pages_sampled, metadata_message_id, category_id, source_file_id, source_chat_id, source_message_id, sync_status, hf_path, hf_url, sha256, sync_error, sync_job_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [record.id, record.title, record.sender, record.sender_id, record.classification, record.source_url, record.received_at, record.strategy || null, record.bytes_read || 0, record.pages_sampled || 0, record.metadata_message_id, record.category_id || null, record.source_file_id || null, record.source_chat_id || null, record.source_message_id || null, record.sync_status || 'pending', record.hf_path || null, record.hf_url || null, record.sha256 || null, record.sync_error || null, record.sync_job_id || null]);
     }
     db.execute('COMMIT');
   } catch (error) {
